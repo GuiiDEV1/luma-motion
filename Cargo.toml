@@ -1,0 +1,29 @@
+[package]
+name = "luma-motion"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["fs"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }
+rayon = "1"
+wgpu = "0.19"
+pollster = "0.3"
+bytemuck = { version = "1.24", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+wry = "0.57"
+tao = "0.35"
+rfd = "0.17"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

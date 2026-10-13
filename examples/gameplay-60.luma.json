@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "name": "Gameplay 60",
+  "theme": "dark",
+  "mode": "advanced",
+  "settings": {
+    "shutter": 180,
+    "samples": 9,
+    "protection": true,
+    "sharpness": 0,
+    "fps": "source",
+    "codec": "h264",
+    "crf": 18,
+    "analysis_width": 720,
+    "search_radius": 24,
+    "weighting": "uniform",
+    "encoder_preset": "fast"
+  }
+}
