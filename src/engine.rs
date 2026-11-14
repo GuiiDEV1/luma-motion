@@ -136,6 +136,9 @@ pub struct Settings {
     pub compression_enabled: bool,
     pub compression_mode: String,
     pub compress_only: bool,
+    pub deduplicate: bool,
+    pub vector_smoothing: bool,
+    pub dehalo: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -166,6 +169,9 @@ impl Default for Settings {
             compression_enabled: false,
             compression_mode: "quality".into(),
             compress_only: false,
+            deduplicate: true,
+            vector_smoothing: true,
+            dehalo: true,
         }
     }
 }
@@ -181,7 +187,7 @@ impl Settings {
             || !(0.0..=2.0).contains(&self.saturation)
             || !(1.0..=10.0).contains(&self.preview_duration)
             || self.shutter > 360
-            || ![5, 9, 15].contains(&self.samples)
+            || ![5, 9, 15, 24, 32].contains(&self.samples)
             || !(0.0..=0.5).contains(&self.sharpness)
             || !["source", "24", "30", "60", "120"].contains(&self.fps.as_str())
             || !["h264", "prores"].contains(&self.codec.as_str())
@@ -199,7 +205,7 @@ impl Settings {
     pub fn validate(&self, meta: &Meta) -> Result<(), String> {
         self.validate_options()?;
         if self.shutter > 360
-            || ![5, 9, 15].contains(&self.samples)
+            || ![5, 9, 15, 24, 32].contains(&self.samples)
             || !(0.0..=0.5).contains(&self.sharpness)
             || !["source", "24", "30", "60", "120"].contains(&self.fps.as_str())
             || !["h264", "prores"].contains(&self.codec.as_str())
@@ -267,11 +273,12 @@ pub fn render(
         }
     }
     let fps = settings.fps.parse::<f64>().unwrap_or(meta.fps);
+    let gpu_interp = gpu.is_some() && fps > meta.fps + 0.1;
     let mut filters = vec![format!("scale={w}:{h}")];
-    if fps > meta.fps + 0.1 {
+    if fps > meta.fps + 0.1 && !gpu_interp {
         filters.insert(0, "tpad=stop_mode=clone:stop_duration=0.1".into());
         filters.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"));
-    } else if settings.fps != "source" {
+    } else if settings.fps != "source" && !gpu_interp {
         filters.push(format!("fps={fps}"));
     }
     let dl = File::create(output.with_extension("decode.log")).map_err(|e| e.to_string())?;
@@ -361,17 +368,51 @@ pub fn render(
         .stdin
         .take()
         .ok_or("Pipe de escrita indisponível.")?;
-    let engine = MotionEngine::configured(
+    let engine = MotionEngine::configured_full(
         settings.analysis_width,
         settings.search_radius,
         &settings.weighting,
         settings.gamma,
         settings.gaussian_sigma,
+        settings.vector_smoothing,
+        settings.dehalo,
     );
     let mut previous: Option<Vec<u8>> = None;
     let mut frame = vec![0u8; w * h * 3];
     let mut gpu_output = Vec::with_capacity(w * h * 3);
+    let mut interp_buf = Vec::with_capacity(w * h * 3);
     let mut count = 0usize;
+    let total_expected = (duration * fps).max(1.0);
+    let interp_ratio = if gpu_interp { fps / meta.fps } else { 1.0 };
+    let mut interp_accum = 0.0f64;
+    let mut dup_pending = 0usize;
+
+    let mut emit_blurred = |prev: Option<&[u8]>,
+                            curr: &[u8],
+                            gpu: &mut Option<crate::gpu::GpuMotion>,
+                            gpu_output: &mut Vec<u8>,
+                            count: &mut usize|
+     -> Result<(), String> {
+        if let Some(gpu) = gpu {
+            gpu.apply_into(prev, curr, gpu_output)?;
+            writer.write_all(gpu_output).map_err(|e| e.to_string())?;
+        } else {
+            let blurred = engine.apply(
+                prev,
+                curr,
+                w,
+                h,
+                settings.shutter,
+                settings.samples,
+                settings.protection,
+            );
+            writer.write_all(&blurred).map_err(|e| e.to_string())?;
+        }
+        *count += 1;
+        update((*count as f64 / total_expected * 100.0).min(99.0));
+        Ok(())
+    };
+
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -392,28 +433,94 @@ pub fn render(
         if filled != frame.len() {
             return Err("Quadro incompleto ao decodificar.".into());
         }
-        if let Some(gpu) = &mut gpu {
-            gpu.apply_into(previous.as_deref(), &frame, &mut gpu_output)?;
-            writer.write_all(&gpu_output).map_err(|e| e.to_string())?;
+
+        if settings.deduplicate
+            && let Some(ref prev) = previous
+            && dup_pending < 6
+            && crate::motion::is_duplicate_frame(prev, &frame, w, h, settings.analysis_width)
+        {
+            dup_pending += 1;
+            continue;
+        }
+
+        if dup_pending > 0
+            && let Some(ref prev) = previous
+        {
+            let steps = dup_pending + 1;
+            let mut rolling_prev = prev.clone();
+            for s_idx in 1..steps {
+                let t = s_idx as f32 / steps as f32;
+                if let Some(g) = &mut gpu {
+                    g.interpolate_into(prev, &frame, t, &mut interp_buf)?;
+                } else {
+                    blend_linear(prev, &frame, t, &mut interp_buf);
+                }
+                emit_blurred(
+                    Some(&rolling_prev),
+                    &interp_buf,
+                    &mut gpu,
+                    &mut gpu_output,
+                    &mut count,
+                )?;
+                std::mem::swap(&mut rolling_prev, &mut interp_buf);
+            }
+            previous = Some(rolling_prev);
+            dup_pending = 0;
+        }
+
+        if gpu_interp && let Some(ref prev) = previous {
+            interp_accum += interp_ratio;
+            let n_out = interp_accum.floor() as usize;
+            interp_accum -= n_out as f64;
+            let mut rolling_prev = prev.clone();
+            for k in 0..n_out {
+                let t = (k + 1) as f32 / n_out as f32;
+                if k + 1 == n_out {
+                    emit_blurred(
+                        Some(&rolling_prev),
+                        &frame,
+                        &mut gpu,
+                        &mut gpu_output,
+                        &mut count,
+                    )?;
+                } else {
+                    if let Some(g) = &mut gpu {
+                        g.interpolate_into(prev, &frame, t, &mut interp_buf)?;
+                    } else {
+                        blend_linear(prev, &frame, t, &mut interp_buf);
+                    }
+                    emit_blurred(
+                        Some(&rolling_prev),
+                        &interp_buf,
+                        &mut gpu,
+                        &mut gpu_output,
+                        &mut count,
+                    )?;
+                    std::mem::swap(&mut rolling_prev, &mut interp_buf);
+                }
+            }
         } else {
-            let blurred = engine.apply(
+            emit_blurred(
                 previous.as_deref(),
                 &frame,
-                w,
-                h,
-                settings.shutter,
-                settings.samples,
-                settings.protection,
-            );
-            writer.write_all(&blurred).map_err(|e| e.to_string())?;
+                &mut gpu,
+                &mut gpu_output,
+                &mut count,
+            )?;
         }
+
         if let Some(ref mut prev) = previous {
             std::mem::swap(prev, &mut frame);
         } else {
             previous = Some(frame.clone());
         }
-        count += 1;
-        update((count as f64 / (duration * fps) * 100.0).min(99.0));
+    }
+    if dup_pending > 0
+        && let Some(ref prev) = previous
+    {
+        for _ in 0..dup_pending {
+            emit_blurred(Some(prev), prev, &mut gpu, &mut gpu_output, &mut count)?;
+        }
     }
     drop(writer);
     let ds = decoder.0.wait().map_err(|e| e.to_string())?;
@@ -559,6 +666,14 @@ fn encoder_label(s: &Settings, nvenc: bool) -> String {
     };
     format!("{codec} · {}", if nvenc { "NVIDIA NVENC" } else { "CPU" })
 }
+fn blend_linear(a: &[u8], b: &[u8], t: f32, out: &mut Vec<u8>) {
+    out.resize(a.len(), 0);
+    let inv = 1.0 - t;
+    for (dst, (&pa, &pb)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *dst = (pa as f32 * inv + pb as f32 * t).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 fn render_direct(
     source: &Path,
     output: &Path,

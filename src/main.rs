@@ -155,6 +155,10 @@ async fn upload(
         }
     }
     drop(file);
+    register_media(&state, path, name).await
+}
+
+async fn register_media(state: &AppState, path: PathBuf, name: String) -> Result<Json<Value>, ApiError> {
     let probe_path = path.clone();
     let info = tokio::task::spawn_blocking(move || engine::probe(&probe_path))
         .await
@@ -162,10 +166,13 @@ async fn upload(
     let meta = match info {
         Ok(meta) => meta,
         Err(e) => {
-            let _ = tokio::fs::remove_file(&path).await;
+            if path.starts_with(&state.work) {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
             return Err(error(StatusCode::BAD_REQUEST, e));
         }
     };
+    let id = uuid::Uuid::new_v4().simple().to_string();
     state.media.lock().unwrap().insert(
         id.clone(),
         Media {
@@ -179,6 +186,35 @@ async fn upload(
     value["name"] = json!(name);
     value["url"] = json!(format!("/api/media/{id}"));
     Ok(Json(value))
+}
+
+#[cfg(windows)]
+async fn pick_media(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Importar vídeo no Luma Motion")
+            .add_filter("Vídeos", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
+            .pick_file()
+    })
+    .await
+    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some(path) = picked else {
+        return Err(error(StatusCode::NO_CONTENT, "cancelled"));
+    };
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("video.mp4")
+        .to_string();
+    register_media(&state, path, name).await
+}
+
+#[cfg(not(windows))]
+async fn pick_media(State(_state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Err(error(
+        StatusCode::NOT_IMPLEMENTED,
+        "Seleção nativa disponível apenas no Windows Desktop.",
+    ))
 }
 async fn serve_file(path: PathBuf, request: Request) -> Response {
     match ServeFile::new(path).oneshot(request).await {
@@ -464,6 +500,7 @@ fn router(data: &std::path::Path) -> (Router, Arc<Mutex<HashMap<String, Job>>>) 
         .route("/api/config", get(get_config).put(save_config))
         .route("/api/config/export", get(export_config))
         .route("/api/media", post(upload))
+        .route("/api/media/pick", post(pick_media))
         .route("/api/media/{id}", get(original))
         .route("/api/jobs", post(create_job))
         .route("/api/jobs/{id}", get(status))

@@ -22,3 +22,39 @@ button,.button{position:relative;overflow:hidden}.click-wave{position:absolute;w
 progress{appearance:none;border:0;border-radius:6px;overflow:hidden}progress::-webkit-progress-bar{background:var(--raised)}progress::-webkit-progress-value{background:var(--accent);border-radius:6px;transition:width .4s cubic-bezier(.22,1,.36,1)}
 
 .compression-card{border:1px solid var(--line);border-radius:12px;padding:0 16px 12px;background:color-mix(in srgb,var(--accent) 3%,transparent);transition:border-color .25s,background .25s}.compression-card:hover{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}.compression-card .section-label{border-top:0}.render-actions #compress{margin-bottom:4px}
+
+/* Luma Motion v0.6 animations & batch queue */
+.dot{animation:health-pulse 2.6s ease-in-out infinite}
+@keyframes health-pulse{0%,100%{box-shadow:0 0 0 3px #bcec5c18}50%{box-shadow:0 0 0 7px #bcec5c04}}
+.button.primary::before{content:'';position:absolute;inset:0;background:linear-gradient(110deg,transparent 25%,#ffffff45 50%,transparent 75%);transform:translateX(-130%);transition:transform .55s cubic-bezier(.22,1,.36,1);pointer-events:none}
+.button.primary:not(:disabled):hover::before{transform:translateX(130%)}
+.switch:after{transition:left .24s cubic-bezier(.34,1.56,.64,1),transform .18s ease}
+.toggle-row:active .switch:after{transform:scale(.92)}
+.note-card,.clip-info,.config-bar{transition:transform .28s cubic-bezier(.22,1,.36,1),border-color .25s ease,box-shadow .28s ease}
+.note-card:hover,.clip-info:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--accent) 35%,var(--line));box-shadow:0 8px 24px #0002}
+#studio-page:not([hidden]) .note-card{animation:card-rise .42s cubic-bezier(.22,1,.36,1) both}
+#studio-page:not([hidden]) .note-card:nth-child(2){animation-delay:70ms}
+#settings-page:not([hidden]) .config-bar{animation:card-rise .35s cubic-bezier(.22,1,.36,1) both}
+#settings-page:not([hidden]) .controls{animation:card-rise .42s cubic-bezier(.22,1,.36,1) .05s both}
+.presets button.active{animation:preset-pop .32s cubic-bezier(.34,1.56,.64,1)}
+#split-line::after{content:'';position:absolute;top:50%;left:50%;width:14px;height:28px;transform:translate(-50%,-50%);border-radius:99px;background:var(--accent);box-shadow:0 0 14px #ccf86c66;border:2px solid var(--bg);animation:split-glow 2.4s ease-in-out infinite}
+#job-box[data-state=running] progress::-webkit-progress-value{background:linear-gradient(90deg,var(--accent),#e8ff9c,var(--accent));background-size:200% 100%;animation:progress-shimmer 1.4s linear infinite}
+.queue-panel{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--bg);animation:card-rise .28s cubic-bezier(.22,1,.36,1) both}
+.queue-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:11px;color:var(--ink)}
+.queue-head span{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 5px;border-radius:99px;background:var(--soft);color:var(--accent);font-size:10px;margin-left:5px}
+.queue-run{border:0;background:var(--soft);color:var(--accent);padding:5px 10px;border-radius:6px;font-size:10px;cursor:pointer;font-weight:600}
+.queue-run:disabled{opacity:.45;cursor:not-allowed}
+.queue-list{display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto}
+.queue-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;border-radius:7px;background:var(--surface);border:1px solid var(--line);font-size:10px;color:var(--muted);animation:queue-enter .25s cubic-bezier(.22,1,.36,1) both}
+.queue-item[data-status=done]{border-color:#ccf86c55;color:var(--ink)}
+.queue-item[data-status=running]{border-color:var(--accent);color:var(--ink)}
+.queue-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queue-remove{border:0;background:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px}
+.queue-remove:hover{color:var(--ink)}
+.queue-save{color:var(--accent);text-decoration:none;font-weight:600;flex-shrink:0}
+@keyframes card-rise{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes preset-pop{0%{transform:scale(.97)}50%{transform:scale(1.02)}100%{transform:scale(1)}}
+@keyframes split-glow{0%,100%{box-shadow:0 0 10px #ccf86c44}50%{box-shadow:0 0 20px #ccf86c88}}
+@keyframes progress-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+@keyframes queue-enter{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.dot,.button.primary::before,#split-line::after,#job-box[data-state=running] progress::-webkit-progress-value{animation:none!important;transition:none!important}}

@@ -17,6 +17,10 @@ struct Params {
     shutter: f32,
     protect: u32,
     cut: u32,
+    flags: u32,
+    interp_t: f32,
+    cfw: u32,
+    cfh: u32,
     padding: u32,
 }
 
@@ -24,8 +28,11 @@ pub struct GpuMotion {
     device: wgpu::Device,
     queue: wgpu::Queue,
     group: wgpu::BindGroup,
+    motion_coarse: wgpu::ComputePipeline,
     motion: wgpu::ComputePipeline,
+    smooth_vectors: wgpu::ComputePipeline,
     integrate: wgpu::ComputePipeline,
+    interpolate: wgpu::ComputePipeline,
     previous: wgpu::Buffer,
     current: wgpu::Buffer,
     params: wgpu::Buffer,
@@ -102,14 +109,21 @@ impl GpuMotion {
         );
         let params = buffer(
             "params",
-            48,
+            std::mem::size_of::<Params>() as u64,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
         let gw = width.min(settings.analysis_width);
         let gh = (height * gw / width).max(1);
+        let fw = gw.div_ceil(8);
+        let fh = gh.div_ceil(8);
         let vectors = buffer(
             "vectors",
-            (gw.div_ceil(8) * gh.div_ceil(8) * 16) as u64,
+            (fw * fh * 16) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let vectors_smooth = buffer(
+            "vectors_smooth",
+            (fw * fh * 16) as u64,
             wgpu::BufferUsages::STORAGE,
         );
         let linear: Vec<f32> = (0..256)
@@ -133,7 +147,7 @@ impl GpuMotion {
         let linear = table("linear", bytemuck::cast_slice(&linear));
         let encoded = table("encoded", bytemuck::cast_slice(&encoded));
         let weights = table("weights", bytemuck::cast_slice(&weights));
-        let entries: Vec<_> = (0..8)
+        let entries: Vec<_> = (0..9)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -142,7 +156,7 @@ impl GpuMotion {
                         wgpu::BufferBindingType::Uniform
                     } else {
                         wgpu::BufferBindingType::Storage {
-                            read_only: binding != 2 && binding != 3,
+                            read_only: !matches!(binding, 2 | 3 | 8),
                         }
                     },
                     has_dynamic_offset: false,
@@ -156,7 +170,15 @@ impl GpuMotion {
             entries: &entries,
         });
         let buffers = [
-            &previous, &current, &vectors, &output, &linear, &encoded, &params, &weights,
+            &previous,
+            &current,
+            &vectors,
+            &output,
+            &linear,
+            &encoded,
+            &params,
+            &weights,
+            &vectors_smooth,
         ];
         let entries: Vec<_> = buffers
             .iter()
@@ -188,8 +210,11 @@ impl GpuMotion {
                 entry_point,
             })
         };
+        let motion_coarse = pipeline("motion_coarse");
         let motion = pipeline("motion");
+        let smooth_vectors = pipeline("smooth_vectors");
         let integrate = pipeline("integrate");
+        let interpolate = pipeline("interpolate");
         if let Some(error) = device.pop_error_scope().await {
             return Err(format!("Falha ao preparar o motor GPU: {error}"));
         }
@@ -197,8 +222,11 @@ impl GpuMotion {
             device,
             queue,
             group,
+            motion_coarse,
             motion,
+            smooth_vectors,
             integrate,
+            interpolate,
             previous,
             current,
             params,
@@ -235,8 +263,6 @@ impl GpuMotion {
             return Ok(());
         };
         let s = &self.settings;
-        let gw = self.width.min(s.analysis_width);
-        let gh = (self.height * gw / self.width).max(1);
         let cut = s.protection
             && motion::is_scene_cut(previous, current, self.width, self.height, s.analysis_width);
         if s.shutter == 0 || cut {
@@ -245,6 +271,45 @@ impl GpuMotion {
             output.extend_from_slice(current);
             return Ok(());
         }
+        self.run_passes(previous, current, None, false, output)
+    }
+
+    /// Synthesizes an intermediate frame at `t` in `(0.0, 1.0)` between `previous` and `current`.
+    /// Does not advance `previous` in streaming mode so the caller can generate multiple sub-frames
+    /// from the same pair before advancing.
+    pub fn interpolate_into(
+        &mut self,
+        previous: &[u8],
+        current: &[u8],
+        t: f32,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let cut = self.settings.protection
+            && motion::is_scene_cut(
+                previous,
+                current,
+                self.width,
+                self.height,
+                self.settings.analysis_width,
+            );
+        self.run_passes(previous, current, Some(t), cut, output)
+    }
+
+    fn run_passes(
+        &mut self,
+        previous: &[u8],
+        current: &[u8],
+        interp_t: Option<f32>,
+        cut: bool,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let s = &self.settings;
+        let gw = self.width.min(s.analysis_width);
+        let gh = (self.height * gw / self.width).max(1);
+        let fw = gw.div_ceil(8);
+        let fh = gh.div_ceil(8);
+        let cfw = (gw / 2).max(1).div_ceil(8);
+        let cfh = (gh / 2).max(1).div_ceil(8);
         let pack = |frame: &[u8], packed: &mut [u32]| {
             packed
                 .par_iter_mut()
@@ -261,18 +326,29 @@ impl GpuMotion {
         pack(current, &mut self.packed);
         self.queue
             .write_buffer(&self.current, 0, bytemuck::cast_slice(&self.packed));
+        let flags = u32::from(s.vector_smoothing)
+            | (u32::from(s.dehalo) << 1)
+            | (u32::from(true) << 2);
         let params = Params {
             w: self.width as u32,
             h: self.height as u32,
             gw: gw as u32,
             gh: gh as u32,
-            fw: gw.div_ceil(8) as u32,
-            fh: gh.div_ceil(8) as u32,
+            fw: fw as u32,
+            fh: fh as u32,
             radius: s.search_radius as u32,
             samples: s.samples as u32,
-            shutter: s.shutter as f32,
+            shutter: if interp_t.is_some() {
+                s.shutter.max(1) as f32
+            } else {
+                s.shutter as f32
+            },
             protect: u32::from(s.protection),
-            cut: 0,
+            cut: u32::from(cut),
+            flags,
+            interp_t: interp_t.unwrap_or(0.0),
+            cfw: cfw as u32,
+            cfh: cfh as u32,
             padding: 0,
         };
         self.queue
@@ -281,6 +357,15 @@ impl GpuMotion {
         let mut commands = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("motion coarse"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.motion_coarse);
+            pass.set_bind_group(0, &self.group, &[]);
+            pass.dispatch_workgroups((params.cfw * params.cfh).div_ceil(64), 1, 1);
+        }
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("motion field"),
@@ -292,10 +377,27 @@ impl GpuMotion {
         }
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("exposure"),
+                label: Some("smooth vectors"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.integrate);
+            pass.set_pipeline(&self.smooth_vectors);
+            pass.set_bind_group(0, &self.group, &[]);
+            pass.dispatch_workgroups((params.fw * params.fh).div_ceil(64), 1, 1);
+        }
+        {
+            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(if interp_t.is_some() {
+                    "interpolate"
+                } else {
+                    "exposure"
+                }),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(if interp_t.is_some() {
+                &self.interpolate
+            } else {
+                &self.integrate
+            });
             pass.set_bind_group(0, &self.group, &[]);
             pass.dispatch_workgroups(params.w.div_ceil(16), params.h.div_ceil(16), 1);
         }
@@ -306,7 +408,7 @@ impl GpuMotion {
             0,
             (self.width * self.height * 4) as u64,
         );
-        if self.streaming {
+        if self.streaming && interp_t.is_none() {
             commands.copy_buffer_to_buffer(
                 &self.current,
                 0,
@@ -338,7 +440,9 @@ impl GpuMotion {
             .for_each(|(out, pixel)| out.copy_from_slice(&pixel[..3]));
         drop(bytes);
         self.readback.unmap();
-        self.previous_ready = self.streaming;
+        if interp_t.is_none() {
+            self.previous_ready = self.streaming;
+        }
         Ok(())
     }
 }

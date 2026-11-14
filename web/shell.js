@@ -7,7 +7,7 @@ window.animateChange = change => {
   pageTransition=document.startViewTransition(change);
 };
 const renderSlot = $('render-slot');
-for (const el of [document.querySelector('.render-actions'), $('job-box'), document.querySelector('.engine-note')]) renderSlot.append(el);
+for (const el of [document.querySelector('.render-actions'), $('queue-panel'), $('job-box'), document.querySelector('.engine-note')]) renderSlot.append(el);
 window.updateSummary = () => {
   const entries=[['Rastro', $('shutter').value + '°'], ['Saída', $('fps').value === 'source' ? 'FPS original' : $('fps').value + ' fps'], ['Motor', $('processing').value==='gpu'?'GPU':'CPU'], ['Formato', $('compression_enabled').checked ? ($('compression_mode').value==='aggressive'?'HEVC / intenso':'HEVC / fidelidade') : $('codec').value === 'prores' ? 'ProRes 422 HQ' : 'MP4 / H.264']];
   entries.forEach(([label,value],i)=>{

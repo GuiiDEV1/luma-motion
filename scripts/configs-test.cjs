@@ -20,5 +20,10 @@ for(const key of ['processing','video_encoder']) assert.throws(()=>validate({...
 
 for(const compression_mode of ['quality','aggressive'])assert.equal(validate({...input,settings:{...input.settings,compression_enabled:true,compression_mode}}).settings.compression_mode,compression_mode);
 assert.equal(validate(legacy).settings.compression_enabled,false);
+assert.equal(validate(legacy).settings.deduplicate,true);
+assert.equal(validate(legacy).settings.vector_smoothing,true);
+assert.equal(validate(legacy).settings.dehalo,true);
+for(const samples of [5,9,15,24,32]) assert.equal(validate({...input,settings:{...input.settings,samples}}).settings.samples,samples);
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_mode:'fake'}}));
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_enabled:'yes'}}));
+assert.throws(()=>validate({...input,settings:{...input.settings,deduplicate:'yes'}}));

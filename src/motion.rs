@@ -2,10 +2,10 @@
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Default)]
-struct Vector {
-    x: f32,
-    y: f32,
-    confidence: f32,
+pub struct Vector {
+    pub x: f32,
+    pub y: f32,
+    pub confidence: f32,
 }
 
 fn gray(frame: &[u8], w: usize, h: usize, gw: usize, gh: usize) -> Vec<u8> {
@@ -49,11 +49,56 @@ fn field(
     protect: bool,
     radius: i32,
 ) -> Vec<Vector> {
+    // 2-level coarse-to-fine pyramid: search at half-resolution first to double effective reach.
+    let cw = (w / 2).max(1);
+    let ch = (h / 2).max(1);
+    let cfw = cw.div_ceil(8);
+    let cfh = ch.div_ceil(8);
+    let mut ca = vec![0u8; cw * ch];
+    let mut cb = vec![0u8; cw * ch];
+    for y in 0..ch {
+        let sy = (y * 2).min(h - 1);
+        for x in 0..cw {
+            let sx = (x * 2).min(w - 1);
+            ca[y * cw + x] = current[sy * w + sx];
+            cb[y * cw + x] = previous[sy * w + sx];
+        }
+    }
+    let coarse_radius = (radius / 2).max(4);
+    let coarse: Vec<(i32, i32)> = (0..cfw * cfh)
+        .into_par_iter()
+        .map(|i| {
+            let x = (i % cfw * 8).min(cw - 1) as i32;
+            let y = (i / cfw * 8).min(ch - 1) as i32;
+            let zero = sad(&ca, &cb, cw, ch, x, y, 0, 0);
+            if zero < 1.0 {
+                return (0, 0);
+            }
+            let mut best = zero;
+            let mut dx = 0;
+            let mut dy = 0;
+            for sy in (-coarse_radius..=coarse_radius).step_by(2) {
+                for sx in (-coarse_radius..=coarse_radius).step_by(2) {
+                    let score = sad(&ca, &cb, cw, ch, x, y, sx, sy)
+                        + (sx.abs() + sy.abs()) as f32 * 0.07;
+                    if score < best {
+                        best = score;
+                        dx = sx;
+                        dy = sy;
+                    }
+                }
+            }
+            (dx * 2, dy * 2)
+        })
+        .collect();
+
     (0..fw * fh)
         .into_par_iter()
         .map(|i| {
-            let x = (i % fw * 8).min(w - 1) as i32;
-            let y = (i / fw * 8).min(h - 1) as i32;
+            let bx = i % fw;
+            let by = i / fw;
+            let x = (bx * 8).min(w - 1) as i32;
+            let y = (by * 8).min(h - 1) as i32;
             let zero = sad(current, previous, w, h, x, y, 0, 0);
             if zero < 1.0 {
                 return Vector {
@@ -61,13 +106,27 @@ fn field(
                     ..Vector::default()
                 };
             }
+            let cx_idx = (bx / 2).min(cfw - 1);
+            let cy_idx = (by / 2).min(cfh - 1);
+            let (seed_x, seed_y) = coarse[cy_idx * cfw + cx_idx];
             let mut best = zero;
             let mut dx = 0;
             let mut dy = 0;
-            // Coarse search, followed by one-pixel refinement. A magnitude penalty
-            // favors stationary or short vectors in ambiguous, repetitive regions.
-            for sy in (-radius..=radius).step_by(2) {
-                for sx in (-radius..=radius).step_by(2) {
+            // Refine around the coarse pyramid seed, and also test local neighborhood.
+            for sy in seed_y - 3..=seed_y + 3 {
+                for sx in seed_x - 3..=seed_x + 3 {
+                    let score = sad(current, previous, w, h, x, y, sx, sy)
+                        + (sx.abs() + sy.abs()) as f32 * 0.07;
+                    if score < best {
+                        best = score;
+                        dx = sx;
+                        dy = sy;
+                    }
+                }
+            }
+            let local_radius = radius.min(8);
+            for sy in (-local_radius..=local_radius).step_by(2) {
+                for sx in (-local_radius..=local_radius).step_by(2) {
                     let score = sad(current, previous, w, h, x, y, sx, sy)
                         + (sx.abs() + sy.abs()) as f32 * 0.07;
                     if score < best {
@@ -99,6 +158,43 @@ fn field(
                 x: dx as f32,
                 y: dy as f32,
                 confidence,
+            }
+        })
+        .collect()
+}
+
+fn smooth_vectors(vectors: &[Vector], fw: usize, fh: usize) -> Vec<Vector> {
+    (0..fw * fh)
+        .into_par_iter()
+        .map(|i| {
+            let x = (i % fw) as isize;
+            let y = (i / fw) as isize;
+            let center = vectors[i];
+            let mut sum_x = center.x * (center.confidence + 0.05) * 2.0;
+            let mut sum_y = center.y * (center.confidence + 0.05) * 2.0;
+            let mut sum_c = center.confidence * 2.0;
+            let mut w_total = (center.confidence + 0.05) * 2.0;
+            let mut count = 2.0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = (x + dx).clamp(0, fw as isize - 1) as usize;
+                    let ny = (y + dy).clamp(0, fh as isize - 1) as usize;
+                    let n = vectors[ny * fw + nx];
+                    let w = n.confidence + 0.05;
+                    sum_x += n.x * w;
+                    sum_y += n.y * w;
+                    sum_c += n.confidence;
+                    w_total += w;
+                    count += 1.0;
+                }
+            }
+            Vector {
+                x: sum_x / w_total,
+                y: sum_y / w_total,
+                confidence: (sum_c / count).clamp(0.0, 1.0),
             }
         })
         .collect()
@@ -169,7 +265,7 @@ pub fn sample_weights(mode: &str, sigma: f32, samples: usize) -> Vec<f32> {
     }
     weights
 }
-pub fn is_scene_cut(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
+pub fn frame_difference(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> f32 {
     let gw = w.min(width);
     let gh = (h * gw / w).max(1);
     let a = gray(current, w, h, gw, gh);
@@ -179,7 +275,16 @@ pub fn is_scene_cut(previous: &[u8], current: &[u8], w: usize, h: usize, width: 
         .map(|(a, b)| a.abs_diff(*b) as f32)
         .sum::<f32>()
         / a.len() as f32
-        > 65.0
+}
+pub fn is_scene_cut(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
+    frame_difference(previous, current, w, h, width) > 65.0
+}
+pub fn is_duplicate_frame(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
+    frame_difference(previous, current, w, h, width) < 0.6
+}
+fn ign(x: usize, y: usize) -> f32 {
+    let v = (0.06711056 * x as f32 + 0.00583715 * y as f32).fract();
+    (52.982_918 * v).fract()
 }
 pub struct MotionEngine {
     linear: [f32; 256],
@@ -188,6 +293,8 @@ pub struct MotionEngine {
     search_radius: i32,
     weighting: String,
     sigma: f32,
+    vector_smoothing: bool,
+    dehalo: bool,
 }
 impl MotionEngine {
     #[cfg(test)]
@@ -197,18 +304,34 @@ impl MotionEngine {
             search_radius: 16,
             weighting: "gaussian".into(),
             sigma: 0.65,
+            vector_smoothing: true,
+            dehalo: true,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / 2.2) * 255.0).round() as u8)
                 .collect(),
         }
     }
+    #[cfg(test)]
     pub fn configured(width: usize, radius: i32, weighting: &str, gamma: f32, sigma: f32) -> Self {
+        Self::configured_full(width, radius, weighting, gamma, sigma, true, true)
+    }
+    pub fn configured_full(
+        width: usize,
+        radius: i32,
+        weighting: &str,
+        gamma: f32,
+        sigma: f32,
+        vector_smoothing: bool,
+        dehalo: bool,
+    ) -> Self {
         Self {
             analysis_width: width,
             search_radius: radius,
             weighting: weighting.into(),
             sigma,
+            vector_smoothing,
+            dehalo,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(gamma)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / gamma) * 255.0).round() as u8)
@@ -247,7 +370,12 @@ impl MotionEngine {
         }
         let fw = gw.div_ceil(8);
         let fh = gh.div_ceil(8);
-        let vectors = field(&a, &b, gw, gh, fw, fh, protect, self.search_radius);
+        let raw_vectors = field(&a, &b, gw, gh, fw, fh, protect, self.search_radius);
+        let vectors = if self.vector_smoothing {
+            smooth_vectors(&raw_vectors, fw, fh)
+        } else {
+            raw_vectors
+        };
         let weights = sample_weights(&self.weighting, self.sigma, samples);
         let scale = w as f32 / gw as f32;
         let mut output = vec![0u8; current.len()];
@@ -262,26 +390,61 @@ impl MotionEngine {
                         pixel.copy_from_slice(&current[p..p + 3]);
                         continue;
                     }
-                    let vx = (vector.x * scale).clamp(-80.0, 80.0);
-                    let vy = (vector.y * scale).clamp(-80.0, 80.0);
+                    let vx = (vector.x * scale).clamp(-160.0, 160.0);
+                    let vy = (vector.y * scale).clamp(-160.0, 160.0);
+                    let center_lin = [
+                        self.linear[current[p] as usize],
+                        self.linear[current[p + 1] as usize],
+                        self.linear[current[p + 2] as usize],
+                    ];
+                    let center_luma =
+                        0.0722 * center_lin[0] + 0.7152 * center_lin[1] + 0.2126 * center_lin[2];
+                    let jitter = (ign(x, y) - 0.5) / samples as f32;
                     let mut integrated = [0.0; 3];
+                    let mut w_sum = 0.0;
                     for (i, weight) in weights.iter().enumerate() {
-                        let t = (i as f32 / (samples - 1) as f32 - 0.5) * shutter as f32 / 360.0;
-                        let color = sample(
-                            current,
-                            w,
-                            h,
-                            x as f32 + vx * t,
-                            y as f32 + vy * t,
-                            &self.linear,
-                        );
+                        let base_t = i as f32 / (samples - 1) as f32 - 0.5;
+                        let t = (base_t + jitter).clamp(-0.5, 0.5) * shutter as f32 / 360.0;
+                        // Bidirectional sampling: use previous frame for negative shutter offsets
+                        // when t < 0, blending smoothly with current.
+                        let color = if t < 0.0 {
+                            sample(
+                                previous,
+                                w,
+                                h,
+                                x as f32 + vx * (t + 1.0),
+                                y as f32 + vy * (t + 1.0),
+                                &self.linear,
+                            )
+                        } else {
+                            sample(
+                                current,
+                                w,
+                                h,
+                                x as f32 + vx * t,
+                                y as f32 + vy * t,
+                                &self.linear,
+                            )
+                        };
+                        let w = if self.dehalo {
+                            let sample_luma =
+                                0.0722 * color[0] + 0.7152 * color[1] + 0.2126 * color[2];
+                            let diff = (sample_luma - center_luma).abs();
+                            let bilateral = (-diff * diff * 6.0).exp().max(0.15);
+                            weight * bilateral
+                        } else {
+                            *weight
+                        };
+                        w_sum += w;
                         for c in 0..3 {
-                            integrated[c] += color[c] * weight;
+                            integrated[c] += color[c] * w;
                         }
                     }
+                    let inv = if w_sum > 0.0 { 1.0 / w_sum } else { 1.0 };
                     for c in 0..3 {
-                        let value = integrated[c] * vector.confidence
-                            + self.linear[current[p + c] as usize] * (1.0 - vector.confidence);
+                        let blurred = integrated[c] * inv;
+                        let value = blurred * vector.confidence
+                            + center_lin[c] * (1.0 - vector.confidence);
                         pixel[c] = self.encoded[(value.clamp(0.0, 1.0) * 4096.0).round() as usize];
                     }
                 }
@@ -362,5 +525,24 @@ mod tests {
         let out = MotionEngine::new().apply(Some(&a), &b, 96, 64, 360, 15, true);
         assert_ne!(out, b);
         assert!(out.iter().any(|v| *v > 0 && *v < 220));
+    }
+    #[test]
+    fn duplicate_detection_and_high_samples() {
+        let mut a = vec![0; 96 * 64 * 3];
+        let mut b = a.clone();
+        for y in 12..50 {
+            for x in 20..50 {
+                for c in 0..3 {
+                    a[(y * 96 + x) * 3 + c] = 220;
+                    b[(y * 96 + x + 8) * 3 + c] = 220;
+                }
+            }
+        }
+        assert!(is_duplicate_frame(&a, &a, 96, 64, 480));
+        assert!(!is_duplicate_frame(&a, &b, 96, 64, 480));
+        let out24 = MotionEngine::new().apply(Some(&a), &b, 96, 64, 360, 24, true);
+        let out32 = MotionEngine::new().apply(Some(&a), &b, 96, 64, 360, 32, true);
+        assert_ne!(out24, b);
+        assert_ne!(out32, b);
     }
 }

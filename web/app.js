@@ -4,27 +4,41 @@ const original = $('original'), result = $('result');
 const formatTime = value => { const n = Number.isFinite(value) ? value : 0; return `${String(Math.floor(n/60)).padStart(2,'0')}:${(n%60).toFixed(2).padStart(5,'0')}`; };
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 6000); }
 async function api(url, options) { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Confira os ajustes e tente novamente.'); return data; }
-function lock(value) { locked = value; ['preview','export','compress'].forEach(id => $(id).disabled = value || !media); ['import-top','import-empty','file'].forEach(id => $(id).disabled = value); }
-['import-top','import-empty'].forEach(id => $(id).onclick = () => $('file').click());
+function lock(value) { locked = value; ['preview','export','compress','add-queue'].forEach(id => $(id).disabled = value || !media); ['import-top','import-empty','file'].forEach(id => $(id).disabled = value); if ($('run-queue')) $('run-queue').disabled = value || !queue.length; }
+async function pickDesktopFile() {
+  if (locked) return;
+  lock(true); window.lumaFeedback?.('import','running');
+  try {
+    const response = await fetch('/api/media/pick', {method:'POST'});
+    if (response.status === 204) { window.lumaFeedback?.('import','idle'); return; }
+    const nextMedia = await response.json();
+    if (!response.ok) throw new Error(typeof nextMedia.detail === 'string' ? nextMedia.detail : 'Não foi possível abrir o vídeo.');
+    applyMedia(nextMedia);
+  } catch (error) { window.lumaFeedback?.('import','error'); toast(error.message); } finally { lock(false); }
+}
+['import-top','import-empty'].forEach(id => $(id).onclick = () => window.LUMA_DESKTOP ? pickDesktopFile() : $('file').click());
 $('file').onchange = () => { if ($('file').files[0]) loadFile($('file').files[0]); };
 const zone = $('dropzone');
 zone.ondragover = event => { event.preventDefault(); zone.classList.add('drag'); };
 zone.ondragleave = () => zone.classList.remove('drag');
 zone.ondrop = event => { event.preventDefault(); zone.classList.remove('drag'); if (!locked && event.dataTransfer.files[0]) loadFile(event.dataTransfer.files[0]); };
+function applyMedia(nextMedia) {
+  original.pause(); result.pause(); media = nextMedia; lastResult = null;
+  original.src = media.url; result.removeAttribute('src'); result.load();
+  $('empty').hidden = true; $('player').hidden = false;
+  $('filename').textContent = media.name; $('file-detail').textContent = `${media.width} × ${media.height} · ${media.fps.toFixed(2)} fps · ${formatTime(media.duration)} · ${media.codec.toUpperCase()}`;
+  $('source-tag').textContent = `${Math.round(media.fps)} FPS`; $('start').max = Math.max(0, media.duration - .1);
+  $('start').value = 0; $('job-box').hidden = true;
+  document.querySelectorAll('[data-view]').forEach(button => button.disabled = button.dataset.view !== 'original');
+  ['play','seek','mute'].forEach(id => $(id).disabled = false); setView('original');
+  window.lumaFeedback?.('import','done'); toast('Vídeo pronto. Escolha um preset e teste uma prévia.');
+}
 async function loadFile(file) {
   lock(true);window.lumaFeedback?.('import','running'); toast('Importando vídeo para o estúdio local…');
   try {
     const body = new FormData(); body.append('file', file);
     const nextMedia = await api('/api/media', {method:'POST',body});
-    original.pause(); result.pause(); media = nextMedia; lastResult = null;
-    original.src = media.url; result.removeAttribute('src'); result.load();
-    $('empty').hidden = true; $('player').hidden = false;
-    $('filename').textContent = media.name; $('file-detail').textContent = `${media.width} × ${media.height} · ${media.fps.toFixed(2)} fps · ${formatTime(media.duration)} · ${media.codec.toUpperCase()}`;
-    $('source-tag').textContent = `${Math.round(media.fps)} FPS`; $('start').max = Math.max(0, media.duration - .1);
-    $('start').value = 0; $('job-box').hidden = true;
-    document.querySelectorAll('[data-view]').forEach(button => button.disabled = button.dataset.view !== 'original');
-    ['play','seek','mute'].forEach(id => $(id).disabled = false); setView('original');
-    window.lumaFeedback?.('import','done');toast('Vídeo pronto. Escolha um preset e teste uma prévia.');
+    applyMedia(nextMedia);
   } catch(error) {window.lumaFeedback?.('import','error'); toast(error.message); } finally { lock(false); $('file').value = ''; }
 }
 const presets = {clean:{shutter:120,samples:9,sharpness:0},smooth:{shutter:180,samples:15,sharpness:10},cinema:{shutter:270,samples:15,sharpness:0}};
@@ -34,10 +48,73 @@ document.querySelectorAll('[data-preset]').forEach(button => button.onclick = ()
 });
 function updateLabels() {$('compression-hint').textContent=$('compression_mode').value==='aggressive'?'HEVC com compressão forte: prioriza tamanho, com perda visível em detalhes e movimentos. Mantém resolução e FPS.':'HEVC com alta fidelidade: prioriza preservar detalhes com perda visual mínima. Não é sem perdas; o tamanho depende do vídeo.';$('engine-badge').textContent='FLOW / '+$('processing').value.toUpperCase();window.updateSummary?.();$('preview').innerHTML=icon('play')+' Testar '+$('preview_duration').value+' segundos';$('preview-tag').textContent='PRÉVIA · ATÉ '+$('preview_duration').value+' SEGUNDOS'; $('shutter-value').textContent = `${$('shutter').value}°`; $('sharpness-value').textContent = `${$('sharpness').value}%`; }
 function markStale() { if (lastResult) $('job-detail').textContent = 'Ajustes alterados. Gere uma nova prévia para ver as mudanças.'; }
-['compression_enabled','compression_mode','shutter','samples','sharpness','protection','fps','codec','crf','start','analysis_width','search_radius','weighting','encoder_preset','gamma','gaussian_sigma','brightness','contrast','saturation','preserve_audio','preview_duration','processing','video_encoder'].forEach(id => $(id).addEventListener('input', () => {updateLabels(); markStale(); if(['shutter','samples','sharpness'].includes(id)) document.querySelectorAll('[data-preset]').forEach(b => b.classList.remove('active')); }));
+['compression_enabled','compression_mode','shutter','samples','sharpness','protection','fps','codec','crf','start','analysis_width','search_radius','weighting','encoder_preset','gamma','gaussian_sigma','brightness','contrast','saturation','preserve_audio','preview_duration','processing','video_encoder','deduplicate','vector_smoothing','dehalo'].forEach(id => $(id).addEventListener('input', () => {updateLabels(); markStale(); if(['shutter','samples','sharpness'].includes(id)) document.querySelectorAll('[data-preset]').forEach(b => b.classList.remove('active')); }));
 $('codec').onchange = () => {if($('compression_enabled').checked&&$('codec').value==='prores')$('codec').value='h264';$('codec').querySelector('[value="prores"]').disabled=$('compression_enabled').checked;$('video_encoder').querySelector('[value="cpu"]').textContent=$('compression_enabled').checked?'CPU · HEVC':'CPU · H.264'; $('crf').disabled = $('codec').value === 'prores'||$('compression_enabled').checked;$('video_encoder').disabled=$('codec').value==='prores'&&!$('compression_enabled').checked;$('codec').querySelector('[value="h264"]').textContent=$('compression_enabled').checked?'MP4 · HEVC comprimido':'MP4 · H.264';};
 $('compression_enabled').addEventListener('input',()=>{$('codec').onchange(); });
-function settings(preview) {return {compression_enabled:$('compression_enabled').checked,compression_mode:$('compression_mode').value,media_id:media.id,shutter:+$('shutter').value,samples:+$('samples').value,protection:$('protection').checked,sharpness:+$('sharpness').value/100,fps:$('fps').value,codec:$('codec').value,crf:+$('crf').value,analysis_width:+$('analysis_width').value,search_radius:+$('search_radius').value,weighting:$('weighting').value,encoder_preset:$('encoder_preset').value,gamma:+$('gamma').value,gaussian_sigma:+$('gaussian_sigma').value,brightness:+$('brightness').value,contrast:+$('contrast').value,saturation:+$('saturation').value,preserve_audio:$('preserve_audio').checked,preview_duration:+$('preview_duration').value,processing:$('processing').value,video_encoder:$('video_encoder').value,start:preview ? +$('start').value : 0,preview};}
+function settings(preview) {return {compression_enabled:$('compression_enabled').checked,compression_mode:$('compression_mode').value,media_id:media.id,shutter:+$('shutter').value,samples:+$('samples').value,protection:$('protection').checked,sharpness:+$('sharpness').value/100,fps:$('fps').value,codec:$('codec').value,crf:+$('crf').value,analysis_width:+$('analysis_width').value,search_radius:+$('search_radius').value,weighting:$('weighting').value,encoder_preset:$('encoder_preset').value,gamma:+$('gamma').value,gaussian_sigma:+$('gaussian_sigma').value,brightness:+$('brightness').value,contrast:+$('contrast').value,saturation:+$('saturation').value,preserve_audio:$('preserve_audio').checked,preview_duration:+$('preview_duration').value,processing:$('processing').value,video_encoder:$('video_encoder').value,deduplicate:$('deduplicate').checked,vector_smoothing:$('vector_smoothing').checked,dehalo:$('dehalo').checked,start:preview ? +$('start').value : 0,preview};}
+const queue = [];
+function renderQueue() {
+  const panel = $('queue-panel'), list = $('queue-list');
+  panel.hidden = queue.length === 0;
+  $('queue-count').textContent = queue.length;
+  $('run-queue').disabled = locked || !queue.some(item => item.status === 'pending');
+  list.innerHTML = '';
+  queue.forEach((item, idx) => {
+    const row = document.createElement('div');
+    row.className = 'queue-item';
+    row.dataset.status = item.status;
+    const title = document.createElement('span');
+    title.textContent = `${item.name} · ${item.request.shutter}° · ${item.request.fps === 'source' ? 'orig' : item.request.fps + 'fps'}`;
+    row.append(title);
+    if (item.status === 'done' && item.jobId) {
+      const dl = document.createElement('a');
+      dl.href = `/api/jobs/${item.jobId}/video?download=true`;
+      dl.textContent = 'Salvar';
+      dl.className = 'queue-save';
+      row.append(dl);
+    } else if (item.status === 'pending') {
+      const rm = document.createElement('button');
+      rm.textContent = '×';
+      rm.className = 'queue-remove';
+      rm.onclick = () => { queue.splice(idx, 1); renderQueue(); };
+      row.append(rm);
+    } else {
+      const st = document.createElement('small');
+      st.textContent = item.status === 'running' ? `${Math.round(item.progress || 0)}%` : item.status === 'error' ? 'Erro' : 'Cancelado';
+      row.append(st);
+    }
+    list.append(row);
+  });
+}
+$('add-queue').onclick = () => {
+  if (!media || locked) return;
+  queue.push({ name: media.name, request: { ...settings(false), compress_only: false }, status: 'pending', progress: 0, jobId: null });
+  renderQueue();
+  toast(`“${media.name}” adicionado à fila (${queue.length}).`);
+};
+$('run-queue').onclick = async () => {
+  if (locked) return;
+  for (const item of queue) {
+    if (item.status !== 'pending') continue;
+    item.status = 'running'; renderQueue();
+    lock(true); $('job-box').hidden = false; window.lumaFeedback?.('render','running'); $('download').hidden = true; $('cancel').hidden = false;
+    $('job-title').textContent = `Fila · ${item.name}`; $('progress').value = 0;
+    try {
+      job = await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(item.request)});
+      while (job) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+        const state = await api(`/api/jobs/${job.id}`); $('progress').value = state.progress; item.progress = state.progress;
+        $('job-title').textContent = `Fila (${item.name}) · ${state.progress.toFixed(0)}%`;
+        if (state.status === 'error') throw new Error(state.error);
+        if (state.status === 'cancelled') { item.status = 'cancelled'; window.lumaFeedback?.('render','cancelled'); break; }
+        if (state.status === 'done') { item.status = 'done'; item.jobId = job.id; window.lumaFeedback?.('render','done'); break; }
+      }
+    } catch (err) { item.status = 'error'; toast(err.message); window.lumaFeedback?.('render','error'); }
+    finally { job = null; $('cancel').hidden = true; lock(false); renderQueue(); }
+    if (item.status === 'cancelled') break;
+  }
+  toast('Processamento da fila finalizado.');
+};
 $('preview').onclick = () => submit(true); $('export').onclick = () => submit(false); $('compress').onclick=()=>submit(false,true);
 async function submit(preview,compressOnly=false) {
   if (!media || locked) return;
