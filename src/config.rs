@@ -39,6 +39,7 @@ impl Config {
         self.settings.trim_start = 0.0;
         self.settings.trim_end = 0.0;
         self.settings.trim_only = false;
+        self.settings.segments.clear();
         Ok(self)
     }
 }

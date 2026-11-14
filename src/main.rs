@@ -260,6 +260,49 @@ async fn original(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Vídeo não encontrado."))?;
     Ok(serve_file(path, request).await)
 }
+async fn filmstrip(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let media = state
+        .media
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Vídeo não encontrado."))?;
+    let out = state.work.join(format!("{id}.filmstrip.jpg"));
+    if !out.is_file() {
+        let out_clone = out.clone();
+        let src = media.path.clone();
+        let dur = media.meta.duration.max(0.2);
+        let ok = tokio::task::spawn_blocking(move || {
+            let fps = (12.0 / dur).clamp(0.05, 24.0);
+            engine::command("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&src)
+                .args([
+                    "-vf",
+                    &format!("fps={fps:.4},scale=160:90:force_original_aspect_ratio=increase,crop=160:90,tile=12x1"),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "6",
+                ])
+                .arg(&out_clone)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if !ok || !out.is_file() {
+            return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Falha ao gerar miniaturas."));
+        }
+    }
+    Ok(serve_file(out, request).await)
+}
 async fn create_job(
     State(state): State<AppState>,
     Json(settings): Json<Settings>,
@@ -526,6 +569,7 @@ fn router(data: &std::path::Path) -> (Router, Arc<Mutex<HashMap<String, Job>>>) 
         .route("/api/media", post(upload))
         .route("/api/media/pick", post(pick_media))
         .route("/api/media/{id}", get(original))
+        .route("/api/media/{id}/filmstrip", get(filmstrip))
         .route("/api/jobs", post(create_job))
         .route("/api/jobs/{id}", get(status))
         .route("/api/jobs/{id}/cancel", post(cancel))

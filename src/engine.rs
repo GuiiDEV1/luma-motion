@@ -107,6 +107,18 @@ pub fn probe(path: &Path) -> Result<Meta, String> {
     })
 }
 
+fn default_speed() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+    #[serde(default = "default_speed")]
+    pub speed: f64,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
@@ -144,8 +156,15 @@ pub struct Settings {
     pub trim_start: f64,
     pub trim_end: f64,
     pub trim_only: bool,
+    pub segments: Vec<Segment>,
     pub interp_mode: String,
     pub restore_quality: String,
+    pub aspect_ratio: String,
+    pub target_mb: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
+    pub audio_gain: f64,
+    pub audio_normalize: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -184,8 +203,15 @@ impl Default for Settings {
             trim_start: 0.0,
             trim_end: 0.0,
             trim_only: false,
+            segments: Vec::new(),
             interp_mode: "auto".into(),
             restore_quality: "off".into(),
+            aspect_ratio: "source".into(),
+            target_mb: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            audio_gain: 1.0,
+            audio_normalize: false,
         }
     }
 }
@@ -199,8 +225,17 @@ impl Settings {
         if !["quality", "aggressive"].contains(&self.compression_mode.as_str())
             || !["cpu", "gpu"].contains(&self.processing.as_str())
             || !["auto", "cpu", "nvenc", "amf", "qsv"].contains(&self.video_encoder.as_str())
-            || !["auto", "gpu", "ffmpeg", "off"].contains(&self.interp_mode.as_str())
+            || !["auto", "gpu", "ffmpeg", "ai_rife", "off"].contains(&self.interp_mode.as_str())
             || !["off", "deblock", "enhance", "ai_2x"].contains(&self.restore_quality.as_str())
+            || !["source", "9:16", "1:1", "4:5"].contains(&self.aspect_ratio.as_str())
+            || !self.target_mb.is_finite()
+            || !(0.0..=500.0).contains(&self.target_mb)
+            || !self.fade_in.is_finite()
+            || !(0.0..=5.0).contains(&self.fade_in)
+            || !self.fade_out.is_finite()
+            || !(0.0..=5.0).contains(&self.fade_out)
+            || !self.audio_gain.is_finite()
+            || !(0.0..=3.0).contains(&self.audio_gain)
             || !(1.0..=3.0).contains(&self.gamma)
             || !(0.1..=2.0).contains(&self.gaussian_sigma)
             || !(-1.0..=1.0).contains(&self.brightness)
@@ -246,6 +281,18 @@ impl Settings {
         if self.trim_end > 0.0 && self.trim_end <= self.trim_start {
             return Err("O ponto final do corte deve ser maior que o início.".into());
         }
+        for seg in &self.segments {
+            if !seg.start.is_finite()
+                || !seg.end.is_finite()
+                || !seg.speed.is_finite()
+                || seg.start < 0.0
+                || seg.end > meta.duration + 0.05
+                || seg.end - seg.start < 0.05
+                || !(0.25..=4.0).contains(&seg.speed)
+            {
+                return Err("Segmento de corte inválido.".into());
+            }
+        }
         Ok(())
     }
 }
@@ -270,11 +317,24 @@ pub fn render(
     settings.validate(&meta)?;
     if settings.trim_only
         || settings.compress_only
-        || (settings.shutter == 0 && settings.restore_quality != "ai_2x")
+        || (settings.shutter == 0
+            && settings.restore_quality != "ai_2x"
+            && settings.interp_mode != "ai_rife")
     {
         return render_direct(source, output, settings, cancel, update, &meta, clock);
     }
-    let (start, duration) = compute_window(settings, &meta);
+    let segs = resolve_segments(settings, &meta);
+    let has_speed = segs.iter().any(|(_, _, spd)| (*spd - 1.0).abs() > 0.01);
+    let out_duration: f64 = segs
+        .iter()
+        .map(|(a, b, spd)| ((b - a) / *spd).max(0.0))
+        .sum::<f64>()
+        .max(0.1);
+    let (start, raw_duration) = if segs.len() == 1 {
+        (segs[0].0, (segs[0].1 - segs[0].0).max(0.1))
+    } else {
+        (0.0, out_duration)
+    };
     let scale = if settings.preview {
         (960.0 / meta.width as f64).min(1.0)
     } else {
@@ -284,7 +344,7 @@ pub fn render(
         Some(run_ai_upscale(
             source,
             start,
-            duration,
+            raw_duration,
             meta.hdr,
             &cancel,
             &update,
@@ -292,9 +352,24 @@ pub fn render(
     } else {
         None
     };
+    let fps = settings.fps.parse::<f64>().unwrap_or(meta.fps);
+    let rife_guard = if settings.interp_mode == "ai_rife" && fps > meta.fps + 0.1 {
+        Some(run_rife_interp(
+            source,
+            start,
+            raw_duration,
+            &meta,
+            fps,
+            &cancel,
+            &update,
+        )?)
+    } else {
+        None
+    };
     let ai_mult = if ai_guard.is_some() { 2 } else { 1 };
-    let w = ((meta.width * ai_mult) as f64 * scale).round() as usize / 2 * 2;
-    let h = ((meta.height * ai_mult) as f64 * scale).round() as usize / 2 * 2;
+    let base_w = ((meta.width * ai_mult) as f64 * scale).round() as usize / 2 * 2;
+    let base_h = ((meta.height * ai_mult) as f64 * scale).round() as usize / 2 * 2;
+    let (w, h) = target_dimensions(base_w, base_h, &settings.aspect_ratio);
     let mut gpu = if settings.processing == "gpu" {
         Some(crate::gpu::GpuMotion::new(w, h, settings)?.streaming())
     } else {
@@ -304,21 +379,24 @@ pub fn render(
         return Err("Interpolação GPU requer o motor do blur em GPU.".into());
     }
     let encoder_kind = resolve_encoder(settings)?;
-    let fps = settings.fps.parse::<f64>().unwrap_or(meta.fps);
-    let wants_interp = fps > meta.fps + 0.1 && settings.interp_mode != "off";
+    let wants_interp =
+        fps > meta.fps + 0.1 && settings.interp_mode != "off" && rife_guard.is_none();
     let gpu_interp = wants_interp && gpu.is_some() && settings.interp_mode != "ffmpeg";
     let mut filters = Vec::new();
-    if meta.hdr && ai_guard.is_none() {
+    if meta.hdr && ai_guard.is_none() && rife_guard.is_none() {
         filters.push("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv".into());
     }
-    if ai_guard.is_none() {
+    if ai_guard.is_none() && rife_guard.is_none() {
         append_restore_pre_filters(&mut filters, settings);
     }
-    filters.push(format!("scale={w}:{h}"));
+    if segs.len() == 1 && has_speed {
+        filters.push(format!("setpts=(PTS-STARTPTS)/{:.4}", segs[0].2));
+    }
+    append_aspect_filter(&mut filters, w, h, &settings.aspect_ratio);
     if wants_interp && !gpu_interp {
         filters.insert(0, "tpad=stop_mode=clone:stop_duration=0.1".into());
         filters.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"));
-    } else if settings.fps != "source" && !gpu_interp {
+    } else if settings.fps != "source" && !gpu_interp && rife_guard.is_none() {
         filters.push(format!("fps={fps}"));
     }
     let dl = File::create(output.with_extension("decode.log")).map_err(|e| e.to_string())?;
@@ -326,22 +404,31 @@ pub fn render(
     let pix_fmt = if gpu.is_some() { "bgra" } else { "bgr24" };
     let stride = if gpu.is_some() { 4usize } else { 3usize };
     let mut decode_cmd = command("ffmpeg");
-    if let Some(ref ai) = ai_guard {
+    if let Some(ref rg) = rife_guard {
+        decode_cmd
+            .args(["-v", "error", "-framerate", &fps.to_string(), "-i"])
+            .arg(rg.out_pattern())
+            .args(["-an", "-vf", &filters.join(",")]);
+    } else if let Some(ref ai) = ai_guard {
         decode_cmd
             .args(["-v", "error", "-framerate", &meta.fps.to_string(), "-i"])
-            .arg(ai.out_pattern());
+            .arg(ai.out_pattern())
+            .args(["-an", "-vf", &filters.join(",")]);
+    } else if segs.len() > 1 {
+        let fc = build_video_concat_filter(&segs, &filters);
+        decode_cmd
+            .args(["-v", "error", "-i"])
+            .arg(source)
+            .args(["-filter_complex", &fc, "-map", "[vout]", "-an"]);
     } else {
         decode_cmd
             .args(["-v", "error", "-ss", &start.to_string(), "-i"])
             .arg(source)
-            .args(["-t", &duration.to_string()]);
+            .args(["-t", &raw_duration.to_string(), "-an", "-vf", &filters.join(",")]);
     }
     let mut decoder = ManagedChild(
         decode_cmd
             .args([
-                "-an",
-                "-vf",
-                &filters.join(","),
                 "-pix_fmt",
                 pix_fmt,
                 "-f",
@@ -353,39 +440,6 @@ pub fn render(
             .spawn()
             .map_err(|e| e.to_string())?,
     );
-    let mut encode = command("ffmpeg");
-    encode
-        .args([
-            "-y",
-            "-v",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            pix_fmt,
-            "-video_size",
-            &format!("{w}x{h}"),
-            "-framerate",
-            &fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-ss",
-            &start.to_string(),
-            "-i",
-        ])
-        .arg(source)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-t",
-            &duration.to_string(),
-        ]);
-    if !settings.preserve_audio {
-        encode.args(["-an"]);
-    }
-    configure_encoder(&mut encode, settings, encoder_kind);
     let mut finishing = Vec::new();
     if settings.restore_quality == "enhance" {
         finishing.push("cas=0.35".into());
@@ -399,9 +453,54 @@ pub fn render(
             settings.brightness, settings.contrast, settings.saturation
         ));
     }
-    if !finishing.is_empty() {
-        encode.args(["-vf", &finishing.join(",")]);
+    append_fade_video_filters(&mut finishing, settings, out_duration);
+    let audio_filters = build_audio_post_filters(settings, out_duration, if segs.len() == 1 { segs[0].2 } else { 1.0 });
+    let mut encode = command("ffmpeg");
+    encode.args([
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        pix_fmt,
+        "-video_size",
+        &format!("{w}x{h}"),
+        "-framerate",
+        &fps.to_string(),
+        "-i",
+        "pipe:0",
+    ]);
+    let has_multi_audio = segs.len() > 1 && settings.preserve_audio && meta.audio;
+    if has_multi_audio {
+        encode.arg("-i").arg(source);
+        let mut fc = build_audio_concat_filter(1, &segs, &audio_filters);
+        if !finishing.is_empty() {
+            fc = format!("[0:v]{}[vfin];{fc}", finishing.join(","));
+            encode.args(["-filter_complex", &fc, "-map", "[vfin]", "-map", "[aout]"]);
+        } else {
+            encode.args(["-filter_complex", &fc, "-map", "0:v:0", "-map", "[aout]"]);
+        }
+    } else if segs.len() > 1 {
+        encode.args(["-map", "0:v:0", "-an"]);
+        if !finishing.is_empty() {
+            encode.args(["-vf", &finishing.join(",")]);
+        }
+    } else {
+        encode
+            .args(["-ss", &start.to_string(), "-i"])
+            .arg(source)
+            .args(["-map", "0:v:0", "-map", "1:a:0?", "-t", &raw_duration.to_string()]);
+        if !settings.preserve_audio {
+            encode.args(["-an"]);
+        } else if !audio_filters.is_empty() {
+            encode.args(["-af", &audio_filters.join(",")]);
+        }
+        if !finishing.is_empty() {
+            encode.args(["-vf", &finishing.join(",")]);
+        }
     }
+    configure_encoder_with_target(&mut encode, settings, encoder_kind, out_duration, meta.audio);
     let mut encoder = ManagedChild(
         encode
             .arg(output)
@@ -436,7 +535,7 @@ pub fn render(
     let mut gpu_output = Vec::with_capacity(w * h * stride);
     let mut interp_buf = Vec::with_capacity(w * h * stride);
     let mut count = 0usize;
-    let total_expected = (duration * fps).max(1.0);
+    let total_expected = (out_duration * fps).max(1.0);
     let interp_ratio = if gpu_interp { fps / meta.fps } else { 1.0 };
     let mut interp_accum = 0.0f64;
     let mut dup_pending = 0usize;
@@ -704,6 +803,153 @@ fn resolve_encoder(s: &Settings) -> Result<&'static str, String> {
     }
 }
 
+fn resolve_segments(s: &Settings, meta: &Meta) -> Vec<(f64, f64, f64)> {
+    if !s.preview && !s.segments.is_empty() {
+        return s
+            .segments
+            .iter()
+            .map(|seg| {
+                (
+                    seg.start.clamp(0.0, meta.duration),
+                    seg.end.min(meta.duration),
+                    seg.speed.clamp(0.25, 4.0),
+                )
+            })
+            .collect();
+    }
+    let (start, dur) = compute_window(s, meta);
+    vec![(start, (start + dur).min(meta.duration), 1.0)]
+}
+
+fn target_dimensions(w: usize, h: usize, aspect: &str) -> (usize, usize) {
+    let even = |v: f64| ((v.round() as usize).max(2) / 2) * 2;
+    match aspect {
+        "9:16" => (even(h as f64 * 9.0 / 16.0), even(h as f64)),
+        "1:1" => {
+            let side = w.min(h);
+            (even(side as f64), even(side as f64))
+        }
+        "4:5" => (even(h as f64 * 4.0 / 5.0), even(h as f64)),
+        _ => (even(w as f64), even(h as f64)),
+    }
+}
+
+fn append_aspect_filter(filters: &mut Vec<String>, w: usize, h: usize, aspect: &str) {
+    if aspect == "source" {
+        filters.push(format!("scale={w}:{h}"));
+    } else {
+        filters.push(format!(
+            "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+        ));
+    }
+}
+
+fn atempo_chain(speed: f64) -> String {
+    let mut parts = Vec::new();
+    let mut rem = speed.clamp(0.25, 4.0);
+    while rem > 2.0 {
+        parts.push("atempo=2.0".to_string());
+        rem /= 2.0;
+    }
+    while rem < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        rem /= 0.5;
+    }
+    if (rem - 1.0).abs() > 0.005 {
+        parts.push(format!("atempo={rem:.4}"));
+    }
+    parts.join(",")
+}
+
+fn append_fade_video_filters(filters: &mut Vec<String>, s: &Settings, out_duration: f64) {
+    if s.fade_in > 0.01 {
+        let d = s.fade_in.min(out_duration * 0.45);
+        filters.push(format!("fade=t=in:st=0:d={d:.3}"));
+    }
+    if s.fade_out > 0.01 {
+        let d = s.fade_out.min(out_duration * 0.45);
+        let st = (out_duration - d).max(0.0);
+        filters.push(format!("fade=t=out:st={st:.3}:d={d:.3}"));
+    }
+}
+
+fn build_audio_post_filters(s: &Settings, out_duration: f64, single_speed: f64) -> Vec<String> {
+    let mut af = Vec::new();
+    if (single_speed - 1.0).abs() > 0.01 {
+        let chain = atempo_chain(single_speed);
+        if !chain.is_empty() {
+            af.push(chain);
+        }
+    }
+    if (s.audio_gain - 1.0).abs() > 0.01 {
+        af.push(format!("volume={:.3}", s.audio_gain));
+    }
+    if s.audio_normalize {
+        af.push("loudnorm".into());
+    }
+    if s.fade_in > 0.01 {
+        let d = s.fade_in.min(out_duration * 0.45);
+        af.push(format!("afade=t=in:st=0:d={d:.3}"));
+    }
+    if s.fade_out > 0.01 {
+        let d = s.fade_out.min(out_duration * 0.45);
+        let st = (out_duration - d).max(0.0);
+        af.push(format!("afade=t=out:st={st:.3}:d={d:.3}"));
+    }
+    af
+}
+
+fn build_video_concat_filter(segs: &[(f64, f64, f64)], extra_filters: &[String]) -> String {
+    let mut parts = Vec::new();
+    let mut labels = String::new();
+    for (i, (a, b, spd)) in segs.iter().enumerate() {
+        let pts = if (*spd - 1.0).abs() > 0.01 {
+            format!("(PTS-STARTPTS)/{spd:.4}")
+        } else {
+            "PTS-STARTPTS".into()
+        };
+        parts.push(format!(
+            "[0:v]trim=start={a:.4}:end={b:.4},setpts={pts}[v{i}]"
+        ));
+        labels.push_str(&format!("[v{i}]"));
+    }
+    if extra_filters.is_empty() {
+        parts.push(format!("{labels}concat=n={}:v=1:a=0[vout]", segs.len()));
+    } else {
+        parts.push(format!("{labels}concat=n={}:v=1:a=0[vc]", segs.len()));
+        parts.push(format!("[vc]{}[vout]", extra_filters.join(",")));
+    }
+    parts.join(";")
+}
+
+fn build_audio_concat_filter(
+    input_idx: usize,
+    segs: &[(f64, f64, f64)],
+    post_af: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    let mut labels = String::new();
+    for (i, (a, b, spd)) in segs.iter().enumerate() {
+        let tempo = if (*spd - 1.0).abs() > 0.01 {
+            let c = atempo_chain(*spd);
+            if c.is_empty() { String::new() } else { format!(",{c}") }
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "[{input_idx}:a]atrim=start={a:.4}:end={b:.4},asetpts=PTS-STARTPTS{tempo}[a{i}]"
+        ));
+        labels.push_str(&format!("[a{i}]"));
+    }
+    if post_af.is_empty() {
+        parts.push(format!("{labels}concat=n={}:v=0:a=1[aout]", segs.len()));
+    } else {
+        parts.push(format!("{labels}concat=n={}:v=0:a=1[ac]", segs.len()));
+        parts.push(format!("[ac]{}[aout]", post_af.join(",")));
+    }
+    parts.join(";")
+}
+
 fn compute_window(s: &Settings, meta: &Meta) -> (f64, f64) {
     if s.preview {
         let start = s.start.clamp(0.0, (meta.duration - 0.1).max(0.0));
@@ -829,9 +1075,205 @@ fn run_ai_upscale(
     Ok(guard)
 }
 
+fn run_rife_interp(
+    source: &Path,
+    start: f64,
+    duration: f64,
+    meta: &Meta,
+    target_fps: f64,
+    cancel: &AtomicBool,
+    update: &impl Fn(f64),
+) -> Result<AiUpscaleGuard, String> {
+    rife_availability()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("luma-rife-{}-{stamp}", std::process::id()));
+    let in_dir = root.join("in");
+    let out_dir = root.join("out");
+    std::fs::create_dir_all(&in_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let guard = AiUpscaleGuard {
+        root,
+        out_dir: out_dir.clone(),
+    };
+
+    let mut extract = command("ffmpeg");
+    extract
+        .args(["-v", "error", "-ss", &start.to_string(), "-i"])
+        .arg(source)
+        .args(["-t", &duration.to_string(), "-an"]);
+    if meta.hdr {
+        extract.args([
+            "-vf",
+            "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv",
+        ]);
+    }
+    let status = extract
+        .arg(in_dir.join("%06d.png"))
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Falha ao extrair quadros para o RIFE IA.".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    update(10.0);
+
+    let in_count = std::fs::read_dir(&in_dir).map(|d| d.count()).unwrap_or(1).max(1);
+    let mult = (target_fps / meta.fps.max(1.0)).max(1.0);
+    let target_frames = ((in_count as f64) * mult).round().max(in_count as f64) as usize;
+
+    let mut ai = ManagedChild(
+        command("rife-ncnn-vulkan")
+            .arg("-i")
+            .arg(&in_dir)
+            .arg("-o")
+            .arg(&out_dir)
+            .args([
+                "-n",
+                &target_frames.to_string(),
+                "-f",
+                "%06d.png",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if let Some(status) = ai.0.try_wait().map_err(|e| e.to_string())? {
+            if !status.success() {
+                return Err("rife-ncnn-vulkan falhou ao interpolar os quadros.".into());
+            }
+            break;
+        }
+        let done = std::fs::read_dir(&out_dir).map(|d| d.count()).unwrap_or(0);
+        update(10.0 + (done as f64 / target_frames.max(1) as f64) * 35.0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(guard)
+}
+
 fn compressed(s: &Settings) -> bool {
     !s.preview && (s.compression_enabled || s.compress_only)
 }
+fn configure_encoder_with_target(
+    cmd: &mut Command,
+    s: &Settings,
+    encoder: &str,
+    out_duration: f64,
+    has_audio: bool,
+) {
+    if !s.preview && s.target_mb > 0.0 && (s.codec != "prores" || compressed(s)) {
+        let compact = compressed(s);
+        let aggressive = s.compression_mode == "aggressive";
+        let audio_kbps = if s.preserve_audio && has_audio {
+            if compact && aggressive { 96.0 } else { 128.0 }
+        } else {
+            0.0
+        };
+        let total_kbps = (s.target_mb * 8192.0 * 0.92) / out_duration.max(0.2);
+        let video_kbps = (total_kbps - audio_kbps).max(120.0).round() as u32;
+        let max_kbps = ((video_kbps as f64) * 1.5).round() as u32;
+        let buf_kbps = video_kbps * 2;
+        let preset = &s.encoder_preset;
+        match encoder {
+            "nvenc" => {
+                let p = match preset.as_str() {
+                    "slow" => "p7",
+                    "medium" => "p5",
+                    _ => "p3",
+                };
+                cmd.args([
+                    "-c:v",
+                    if compact { "hevc_nvenc" } else { "h264_nvenc" },
+                    "-preset",
+                    p,
+                    "-rc",
+                    "vbr",
+                    "-b:v",
+                    &format!("{video_kbps}k"),
+                    "-maxrate",
+                    &format!("{max_kbps}k"),
+                    "-bufsize",
+                    &format!("{buf_kbps}k"),
+                ]);
+            }
+            "amf" => {
+                let qm = match preset.as_str() {
+                    "slow" => "quality",
+                    "medium" => "balanced",
+                    _ => "speed",
+                };
+                cmd.args([
+                    "-c:v",
+                    if compact { "hevc_amf" } else { "h264_amf" },
+                    "-quality",
+                    qm,
+                    "-rc",
+                    "vbr_latency",
+                    "-b:v",
+                    &format!("{video_kbps}k"),
+                    "-maxrate",
+                    &format!("{max_kbps}k"),
+                ]);
+            }
+            "qsv" => {
+                let qp = match preset.as_str() {
+                    "slow" => "veryslow",
+                    "medium" => "medium",
+                    _ => "veryfast",
+                };
+                cmd.args([
+                    "-c:v",
+                    if compact { "hevc_qsv" } else { "h264_qsv" },
+                    "-preset",
+                    qp,
+                    "-b:v",
+                    &format!("{video_kbps}k"),
+                    "-maxrate",
+                    &format!("{max_kbps}k"),
+                ]);
+            }
+            _ => {
+                cmd.args([
+                    "-c:v",
+                    if compact { "libx265" } else { "libx264" },
+                    "-preset",
+                    preset,
+                    "-b:v",
+                    &format!("{video_kbps}k"),
+                    "-maxrate",
+                    &format!("{max_kbps}k"),
+                    "-bufsize",
+                    &format!("{buf_kbps}k"),
+                ]);
+            }
+        }
+        if compact {
+            cmd.args(["-tag:v", "hvc1"]);
+        }
+        cmd.args([
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            if compact && aggressive { "96k" } else { "128k" },
+            "-movflags",
+            "+faststart",
+        ]);
+        return;
+    }
+    configure_encoder(cmd, s, encoder);
+}
+
 fn configure_encoder(cmd: &mut Command, s: &Settings, encoder: &str) {
     if s.codec == "prores" && !s.preview && !compressed(s) {
         cmd.args([
@@ -970,29 +1412,33 @@ fn render_direct(
     meta: &Meta,
     clock: std::time::Instant,
 ) -> Result<Meta, String> {
-    let (start, duration) = compute_window(s, meta);
+    let segs = resolve_segments(s, meta);
+    let has_speed = segs.iter().any(|(_, _, spd)| (*spd - 1.0).abs() > 0.01);
+    let out_duration: f64 = segs
+        .iter()
+        .map(|(a, b, spd)| ((b - a) / *spd).max(0.0))
+        .sum::<f64>()
+        .max(0.1);
+    let raw_duration: f64 = segs
+        .iter()
+        .map(|(a, b, _)| (b - a).max(0.0))
+        .sum::<f64>()
+        .max(0.1);
     let encoder_kind = resolve_encoder(s)?;
-    let mut cmd = command("ffmpeg");
-    cmd.args(["-y", "-v", "error", "-ss", &start.to_string(), "-i"])
-        .arg(source)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-t",
-            &duration.to_string(),
-        ]);
     let scale = if s.preview {
         (960.0 / meta.width as f64).min(1.0)
     } else {
         1.0
     };
-    let w = (meta.width as f64 * scale).round() as usize / 2 * 2;
-    let h = (meta.height as f64 * scale).round() as usize / 2 * 2;
+    let base_w = (meta.width as f64 * scale).round() as usize / 2 * 2;
+    let base_h = (meta.height as f64 * scale).round() as usize / 2 * 2;
+    let (w, h) = target_dimensions(base_w, base_h, &s.aspect_ratio);
     let mut filters = Vec::new();
-    if w != meta.width || h != meta.height {
-        filters.push(format!("scale={w}:{h}"));
+    if segs.len() == 1 && has_speed {
+        filters.push(format!("setpts=(PTS-STARTPTS)/{:.4}", segs[0].2));
+    }
+    if w != meta.width || h != meta.height || s.aspect_ratio != "source" {
+        append_aspect_filter(&mut filters, w, h, &s.aspect_ratio);
     }
     if !s.trim_only && !s.compress_only {
         append_restore_pre_filters(&mut filters, s);
@@ -1016,13 +1462,44 @@ fn render_direct(
             ));
         }
     }
-    if !filters.is_empty() {
-        cmd.args(["-vf", &filters.join(",")]);
+    append_fade_video_filters(&mut filters, s, out_duration);
+    let audio_filters = build_audio_post_filters(s, out_duration, if segs.len() == 1 { segs[0].2 } else { 1.0 });
+    let mut cmd = command("ffmpeg");
+    if segs.len() > 1 {
+        let mut fc = build_video_concat_filter(&segs, &filters);
+        let with_audio = s.preserve_audio && meta.audio;
+        if with_audio {
+            fc = format!("{fc};{}", build_audio_concat_filter(0, &segs, &audio_filters));
+            cmd.args(["-y", "-v", "error", "-i"])
+                .arg(source)
+                .args(["-filter_complex", &fc, "-map", "[vout]", "-map", "[aout]"]);
+        } else {
+            cmd.args(["-y", "-v", "error", "-i"])
+                .arg(source)
+                .args(["-filter_complex", &fc, "-map", "[vout]", "-an"]);
+        }
+    } else {
+        let start = segs[0].0;
+        cmd.args(["-y", "-v", "error", "-ss", &start.to_string(), "-i"])
+            .arg(source)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-t",
+                &raw_duration.to_string(),
+            ]);
+        if !filters.is_empty() {
+            cmd.args(["-vf", &filters.join(",")]);
+        }
+        if !s.preserve_audio {
+            cmd.arg("-an");
+        } else if !audio_filters.is_empty() {
+            cmd.args(["-af", &audio_filters.join(",")]);
+        }
     }
-    if !s.preserve_audio {
-        cmd.arg("-an");
-    }
-    configure_encoder(&mut cmd, s, encoder_kind);
+    configure_encoder_with_target(&mut cmd, s, encoder_kind, out_duration, meta.audio);
     let log_path = output.with_extension("encode.log");
     let log = File::create(&log_path).map_err(|e| e.to_string())?;
     let mut child = ManagedChild(
@@ -1055,7 +1532,7 @@ fn render_direct(
             return Err("cancelled".into());
         }
         if let Ok(time) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            update((time / (duration * 10000.0)).clamp(0.0, 99.0));
+            update((time / (out_duration * 10000.0)).clamp(0.0, 99.0));
         }
         if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
             if !status.success() {

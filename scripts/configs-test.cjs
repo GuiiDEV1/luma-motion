@@ -17,7 +17,9 @@ for(const weighting of ['gaussian','gaussian_bound','vegas','uniform','pyramid',
 assert.equal(validate(legacy).settings.processing,'cpu');assert.equal(validate(legacy).settings.video_encoder,'auto');
 assert.equal(validate(legacy).settings.interp_mode,'auto');assert.equal(validate(legacy).settings.restore_quality,'off');
 for(const processing of ['cpu','gpu']) for(const video_encoder of ['auto','cpu','nvenc','amf','qsv']) assert.equal(validate({...input,settings:{...input.settings,processing,video_encoder}}).settings.video_encoder,video_encoder);
-for(const interp_mode of ['auto','gpu','ffmpeg','off']) assert.equal(validate({...input,settings:{...input.settings,interp_mode}}).settings.interp_mode,interp_mode);
+for(const interp_mode of ['auto','gpu','ffmpeg','ai_rife','off']) assert.equal(validate({...input,settings:{...input.settings,interp_mode}}).settings.interp_mode,interp_mode);
+for(const aspect_ratio of ['source','9:16','1:1','4:5']) assert.equal(validate({...input,settings:{...input.settings,aspect_ratio}}).settings.aspect_ratio,aspect_ratio);
+assert.equal(validate({...input,settings:{...input.settings,target_mb:10,fade_in:0.5,fade_out:0.5,audio_gain:1.5,audio_normalize:true}}).settings.target_mb,10);
 for(const restore_quality of ['off','deblock','enhance','ai_2x']) assert.equal(validate({...input,settings:{...input.settings,restore_quality}}).settings.restore_quality,restore_quality);
 for(const fps of ['source','24','60','90','144','240']) assert.equal(validate({...input,settings:{...input.settings,fps}}).settings.fps,fps);
 for(const key of ['processing','video_encoder','interp_mode','restore_quality','fps']) assert.throws(()=>validate({...input,settings:{...input.settings,[key]:'bad'}}));
