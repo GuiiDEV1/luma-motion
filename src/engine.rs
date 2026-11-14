@@ -141,6 +141,11 @@ pub struct Settings {
     pub dehalo: bool,
     pub hud_protect: bool,
     pub subframe_blend: bool,
+    pub trim_start: f64,
+    pub trim_end: f64,
+    pub trim_only: bool,
+    pub interp_mode: String,
+    pub restore_quality: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -167,7 +172,7 @@ impl Default for Settings {
             preserve_audio: true,
             preview_duration: 3.0,
             processing: "cpu".into(),
-            video_encoder: "cpu".into(),
+            video_encoder: "auto".into(),
             compression_enabled: false,
             compression_mode: "quality".into(),
             compress_only: false,
@@ -176,14 +181,26 @@ impl Default for Settings {
             dehalo: true,
             hud_protect: true,
             subframe_blend: true,
+            trim_start: 0.0,
+            trim_end: 0.0,
+            trim_only: false,
+            interp_mode: "auto".into(),
+            restore_quality: "off".into(),
         }
     }
 }
 impl Settings {
     pub fn validate_options(&self) -> Result<(), String> {
+        let valid_fps = self.fps == "source"
+            || self
+                .fps
+                .parse::<f64>()
+                .is_ok_and(|f| f.is_finite() && (1.0..=240.0).contains(&f));
         if !["quality", "aggressive"].contains(&self.compression_mode.as_str())
             || !["cpu", "gpu"].contains(&self.processing.as_str())
-            || !["cpu", "nvenc"].contains(&self.video_encoder.as_str())
+            || !["auto", "cpu", "nvenc", "amf", "qsv"].contains(&self.video_encoder.as_str())
+            || !["auto", "gpu", "ffmpeg", "off"].contains(&self.interp_mode.as_str())
+            || !["off", "deblock", "enhance", "ai_2x"].contains(&self.restore_quality.as_str())
             || !(1.0..=3.0).contains(&self.gamma)
             || !(0.1..=2.0).contains(&self.gaussian_sigma)
             || !(-1.0..=1.0).contains(&self.brightness)
@@ -191,13 +208,17 @@ impl Settings {
             || !(0.0..=2.0).contains(&self.saturation)
             || !(1.0..=10.0).contains(&self.preview_duration)
             || self.shutter > 360
-            || ![5, 9, 15, 24, 32].contains(&self.samples)
+            || !(3..=64).contains(&self.samples)
             || !(0.0..=0.5).contains(&self.sharpness)
-            || !["source", "24", "30", "60", "120"].contains(&self.fps.as_str())
+            || !valid_fps
             || !["h264", "prores"].contains(&self.codec.as_str())
-            || !(14..=28).contains(&self.crf)
-            || ![320, 480, 720].contains(&self.analysis_width)
-            || ![8, 16, 24].contains(&self.search_radius)
+            || !(0..=40).contains(&self.crf)
+            || !(240..=1280).contains(&self.analysis_width)
+            || !(4..=48).contains(&self.search_radius)
+            || !self.trim_start.is_finite()
+            || self.trim_start < 0.0
+            || !self.trim_end.is_finite()
+            || self.trim_end < 0.0
             || ![
                 "gaussian",
                 "gaussian_bound",
@@ -216,17 +237,14 @@ impl Settings {
     }
     pub fn validate(&self, meta: &Meta) -> Result<(), String> {
         self.validate_options()?;
-        if self.shutter > 360
-            || ![5, 9, 15, 24, 32].contains(&self.samples)
-            || !(0.0..=0.5).contains(&self.sharpness)
-            || !["source", "24", "30", "60", "120"].contains(&self.fps.as_str())
-            || !["h264", "prores"].contains(&self.codec.as_str())
-            || !(14..=28).contains(&self.crf)
-            || !self.start.is_finite()
-            || self.start < 0.0
-            || self.start >= meta.duration
-        {
+        if !self.start.is_finite() || self.start < 0.0 || self.start >= meta.duration {
             return Err("Confira os ajustes e a posição de início.".into());
+        }
+        if self.trim_start >= meta.duration {
+            return Err("O ponto inicial do corte excede a duração do vídeo.".into());
+        }
+        if self.trim_end > 0.0 && self.trim_end <= self.trim_start {
+            return Err("O ponto final do corte deve ser maior que o início.".into());
         }
         Ok(())
     }
@@ -250,48 +268,54 @@ pub fn render(
     let clock = std::time::Instant::now();
     let meta = probe(source)?;
     settings.validate(&meta)?;
-    if settings.compress_only || settings.shutter == 0 {
+    if settings.trim_only
+        || settings.compress_only
+        || (settings.shutter == 0 && settings.restore_quality != "ai_2x")
+    {
         return render_direct(source, output, settings, cancel, update, &meta, clock);
     }
-    let start = if settings.preview {
-        settings.start
-    } else {
-        0.0
-    };
-    let duration = if settings.preview {
-        (meta.duration - start).min(settings.preview_duration)
-    } else {
-        meta.duration
-    };
+    let (start, duration) = compute_window(settings, &meta);
     let scale = if settings.preview {
         (960.0 / meta.width as f64).min(1.0)
     } else {
         1.0
     };
-    let w = (meta.width as f64 * scale).round() as usize / 2 * 2;
-    let h = (meta.height as f64 * scale).round() as usize / 2 * 2;
+    let ai_guard = if settings.restore_quality == "ai_2x" {
+        Some(run_ai_upscale(
+            source,
+            start,
+            duration,
+            meta.hdr,
+            &cancel,
+            &update,
+        )?)
+    } else {
+        None
+    };
+    let ai_mult = if ai_guard.is_some() { 2 } else { 1 };
+    let w = ((meta.width * ai_mult) as f64 * scale).round() as usize / 2 * 2;
+    let h = ((meta.height * ai_mult) as f64 * scale).round() as usize / 2 * 2;
     let mut gpu = if settings.processing == "gpu" {
         Some(crate::gpu::GpuMotion::new(w, h, settings)?.streaming())
     } else {
         None
     };
-    let use_nvenc = settings.video_encoder == "nvenc"
-        && (settings.codec != "prores" || settings.preview || settings.compression_enabled);
-    if use_nvenc {
-        if compressed(settings) {
-            hevc_nvenc_availability()?;
-        } else {
-            nvenc_availability()?;
-        }
+    if settings.interp_mode == "gpu" && gpu.is_none() {
+        return Err("Interpolação GPU requer o motor do blur em GPU.".into());
     }
+    let encoder_kind = resolve_encoder(settings)?;
     let fps = settings.fps.parse::<f64>().unwrap_or(meta.fps);
-    let gpu_interp = gpu.is_some() && fps > meta.fps + 0.1;
+    let wants_interp = fps > meta.fps + 0.1 && settings.interp_mode != "off";
+    let gpu_interp = wants_interp && gpu.is_some() && settings.interp_mode != "ffmpeg";
     let mut filters = Vec::new();
-    if meta.hdr {
+    if meta.hdr && ai_guard.is_none() {
         filters.push("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv".into());
     }
+    if ai_guard.is_none() {
+        append_restore_pre_filters(&mut filters, settings);
+    }
     filters.push(format!("scale={w}:{h}"));
-    if fps > meta.fps + 0.1 && !gpu_interp {
+    if wants_interp && !gpu_interp {
         filters.insert(0, "tpad=stop_mode=clone:stop_duration=0.1".into());
         filters.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"));
     } else if settings.fps != "source" && !gpu_interp {
@@ -301,13 +325,20 @@ pub fn render(
     let el = File::create(output.with_extension("encode.log")).map_err(|e| e.to_string())?;
     let pix_fmt = if gpu.is_some() { "bgra" } else { "bgr24" };
     let stride = if gpu.is_some() { 4usize } else { 3usize };
-    let mut decoder = ManagedChild(
-        command("ffmpeg")
+    let mut decode_cmd = command("ffmpeg");
+    if let Some(ref ai) = ai_guard {
+        decode_cmd
+            .args(["-v", "error", "-framerate", &meta.fps.to_string(), "-i"])
+            .arg(ai.out_pattern());
+    } else {
+        decode_cmd
             .args(["-v", "error", "-ss", &start.to_string(), "-i"])
             .arg(source)
+            .args(["-t", &duration.to_string()]);
+    }
+    let mut decoder = ManagedChild(
+        decode_cmd
             .args([
-                "-t",
-                &duration.to_string(),
                 "-an",
                 "-vf",
                 &filters.join(","),
@@ -354,8 +385,11 @@ pub fn render(
     if !settings.preserve_audio {
         encode.args(["-an"]);
     }
-    configure_encoder(&mut encode, settings, use_nvenc);
+    configure_encoder(&mut encode, settings, encoder_kind);
     let mut finishing = Vec::new();
+    if settings.restore_quality == "enhance" {
+        finishing.push("cas=0.35".into());
+    }
     if settings.sharpness > 0.0 {
         finishing.push(format!("unsharp=5:5:{}:5:5:0", settings.sharpness));
     }
@@ -553,53 +587,252 @@ pub fn render(
             .map(|g| format!("GPU · {}", g.name))
             .unwrap_or_else(|| "CPU · Rayon".into()),
     );
-    result.encoder = Some(encoder_label(settings, use_nvenc));
+    result.encoder = Some(encoder_label(settings, encoder_kind));
     result.source_bytes = meta.bytes;
     result.render_seconds = clock.elapsed().as_secs_f64();
     Ok(result)
 }
 
-pub fn nvenc_availability() -> Result<(), String> {
-    static STATUS: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    STATUS
-        .get_or_init(|| {
-            let result = command("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "color=size=320x240:rate=30",
-                    "-frames:v",
-                    "1",
-                    "-c:v",
-                    "h264_nvenc",
-                    "-f",
-                    "null",
-                    "-",
-                ])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if result.status.success() {
+pub fn probe_encoder(codec: &str) -> Result<(), String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(existing) = cache.lock().unwrap().get(codec).cloned() {
+        return existing;
+    }
+    let result = command("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=320x240:rate=30",
+            "-frames:v",
+            "1",
+            "-c:v",
+            codec,
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|e| e.to_string())
+        .and_then(|out| {
+            if out.status.success() {
                 Ok(())
             } else {
                 Err(format!(
-                    "NVENC indisponível. Use encoder CPU. {}",
-                    String::from_utf8_lossy(&result.stderr)
+                    "Encoder {codec} indisponível: {}",
+                    String::from_utf8_lossy(&out.stderr)
                         .chars()
-                        .take(500)
+                        .take(300)
                         .collect::<String>()
                 ))
             }
+        });
+    cache
+        .lock()
+        .unwrap()
+        .insert(codec.to_string(), result.clone());
+    result
+}
+
+pub fn encoder_availability(kind: &str, hevc: bool) -> Result<(), String> {
+    let codec = match (kind, hevc) {
+        ("nvenc", true) => "hevc_nvenc",
+        ("nvenc", false) => "h264_nvenc",
+        ("amf", true) => "hevc_amf",
+        ("amf", false) => "h264_amf",
+        ("qsv", true) => "hevc_qsv",
+        ("qsv", false) => "h264_qsv",
+        _ => return Ok(()),
+    };
+    probe_encoder(codec)
+}
+
+pub fn realesrgan_availability() -> Result<(), String> {
+    static STATUS: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    STATUS
+        .get_or_init(|| match command("realesrgan-ncnn-vulkan").arg("-h").output() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(
+                "realesrgan-ncnn-vulkan não encontrado em bin/ ou no PATH.".into(),
+            ),
         })
         .clone()
+}
+
+pub fn rife_availability() -> Result<(), String> {
+    static STATUS: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    STATUS
+        .get_or_init(|| match command("rife-ncnn-vulkan").arg("-h").output() {
+            Ok(_) => Ok(()),
+            Err(_) => Err("rife-ncnn-vulkan não encontrado em bin/ ou no PATH.".into()),
+        })
+        .clone()
+}
+
+fn resolve_encoder(s: &Settings) -> Result<&'static str, String> {
+    if s.codec == "prores" && !s.preview && !compressed(s) {
+        return Ok("cpu");
+    }
+    let hevc = compressed(s);
+    match s.video_encoder.as_str() {
+        "cpu" => Ok("cpu"),
+        "nvenc" => {
+            encoder_availability("nvenc", hevc)?;
+            Ok("nvenc")
+        }
+        "amf" => {
+            encoder_availability("amf", hevc)?;
+            Ok("amf")
+        }
+        "qsv" => {
+            encoder_availability("qsv", hevc)?;
+            Ok("qsv")
+        }
+        _ => {
+            for kind in ["nvenc", "amf", "qsv"] {
+                if encoder_availability(kind, hevc).is_ok() {
+                    return Ok(kind);
+                }
+            }
+            Ok("cpu")
+        }
+    }
+}
+
+fn compute_window(s: &Settings, meta: &Meta) -> (f64, f64) {
+    if s.preview {
+        let start = s.start.clamp(0.0, (meta.duration - 0.1).max(0.0));
+        let end = if s.trim_end > start {
+            s.trim_end.min(meta.duration)
+        } else {
+            meta.duration
+        };
+        (start, (end - start).min(s.preview_duration).max(0.1))
+    } else {
+        let start = s.trim_start.clamp(0.0, (meta.duration - 0.1).max(0.0));
+        let end = if s.trim_end > start {
+            s.trim_end.min(meta.duration)
+        } else {
+            meta.duration
+        };
+        (start, (end - start).max(0.1))
+    }
+}
+
+fn append_restore_pre_filters(filters: &mut Vec<String>, s: &Settings) {
+    match s.restore_quality.as_str() {
+        "deblock" => {
+            filters.push("deblock=filter=weak:block=4,deband".into());
+        }
+        "enhance" => {
+            filters.push("deblock=filter=strong:block=4,hqdn3d=1.5:1.5:3:3,deband".into());
+        }
+        _ => {}
+    }
+}
+
+struct AiUpscaleGuard {
+    root: std::path::PathBuf,
+    out_dir: std::path::PathBuf,
+}
+
+impl AiUpscaleGuard {
+    fn out_pattern(&self) -> std::path::PathBuf {
+        self.out_dir.join("%06d.png")
+    }
+}
+
+impl Drop for AiUpscaleGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn run_ai_upscale(
+    source: &Path,
+    start: f64,
+    duration: f64,
+    hdr: bool,
+    cancel: &AtomicBool,
+    update: &impl Fn(f64),
+) -> Result<AiUpscaleGuard, String> {
+    realesrgan_availability()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("luma-ai-{}-{stamp}", std::process::id()));
+    let in_dir = root.join("in");
+    let out_dir = root.join("out");
+    std::fs::create_dir_all(&in_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let guard = AiUpscaleGuard { root, out_dir: out_dir.clone() };
+
+    let mut extract = command("ffmpeg");
+    extract
+        .args(["-v", "error", "-ss", &start.to_string(), "-i"])
+        .arg(source)
+        .args(["-t", &duration.to_string(), "-an"]);
+    if hdr {
+        extract.args([
+            "-vf",
+            "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv",
+        ]);
+    }
+    let status = extract
+        .arg(in_dir.join("%06d.png"))
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Falha ao extrair quadros para o upscaling por IA.".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    update(10.0);
+
+    let mut ai = ManagedChild(
+        command("realesrgan-ncnn-vulkan")
+            .arg("-i")
+            .arg(&in_dir)
+            .arg("-o")
+            .arg(&out_dir)
+            .args(["-s", "2", "-n", "realesrgan-x4plus", "-f", "png"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let total = std::fs::read_dir(&in_dir)
+        .map(|d| d.count())
+        .unwrap_or(1)
+        .max(1);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if let Some(status) = ai.0.try_wait().map_err(|e| e.to_string())? {
+            if !status.success() {
+                return Err("realesrgan-ncnn-vulkan falhou ao processar os quadros.".into());
+            }
+            break;
+        }
+        let done = std::fs::read_dir(&out_dir).map(|d| d.count()).unwrap_or(0);
+        update(10.0 + (done as f64 / total as f64) * 35.0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(guard)
 }
 
 fn compressed(s: &Settings) -> bool {
     !s.preview && (s.compression_enabled || s.compress_only)
 }
-fn configure_encoder(cmd: &mut Command, s: &Settings, nvenc: bool) {
+fn configure_encoder(cmd: &mut Command, s: &Settings, encoder: &str) {
     if s.codec == "prores" && !s.preview && !compressed(s) {
         cmd.args([
             "-c:v",
@@ -625,33 +858,70 @@ fn configure_encoder(cmd: &mut Command, s: &Settings, nvenc: bool) {
     } else {
         &s.encoder_preset
     };
-    if nvenc {
-        let preset = match preset {
-            "slow" => "p7",
-            "medium" => "p5",
-            _ => "p3",
-        };
-        cmd.args([
-            "-c:v",
-            if compact { "hevc_nvenc" } else { "h264_nvenc" },
-            "-preset",
-            preset,
-            "-rc",
-            "vbr",
-            "-cq",
-            &quality.to_string(),
-            "-b:v",
-            "0",
-        ]);
-    } else {
-        cmd.args([
-            "-c:v",
-            if compact { "libx265" } else { "libx264" },
-            "-preset",
-            preset,
-            "-crf",
-            &quality.to_string(),
-        ]);
+    match encoder {
+        "nvenc" => {
+            let preset = match preset {
+                "slow" => "p7",
+                "medium" => "p5",
+                _ => "p3",
+            };
+            cmd.args([
+                "-c:v",
+                if compact { "hevc_nvenc" } else { "h264_nvenc" },
+                "-preset",
+                preset,
+                "-rc",
+                "vbr",
+                "-cq",
+                &quality.to_string(),
+                "-b:v",
+                "0",
+            ]);
+        }
+        "amf" => {
+            let quality_mode = match preset {
+                "slow" => "quality",
+                "medium" => "balanced",
+                _ => "speed",
+            };
+            cmd.args([
+                "-c:v",
+                if compact { "hevc_amf" } else { "h264_amf" },
+                "-quality",
+                quality_mode,
+                "-rc",
+                "cqp",
+                "-qp_i",
+                &quality.to_string(),
+                "-qp_p",
+                &quality.to_string(),
+            ]);
+        }
+        "qsv" => {
+            let qsv_preset = match preset {
+                "slow" => "veryslow",
+                "medium" => "medium",
+                _ => "veryfast",
+            };
+            cmd.args([
+                "-c:v",
+                if compact { "hevc_qsv" } else { "h264_qsv" },
+                "-preset",
+                qsv_preset,
+                "-global_quality",
+                &quality.to_string(),
+            ]);
+        }
+        _ => {
+            cmd.args([
+                "-c:v",
+                if compact { "libx265" } else { "libx264" },
+                "-preset",
+                preset,
+                "-crf",
+                &quality.to_string(),
+            ]);
+        }
     }
     if compact {
         cmd.args(["-tag:v", "hvc1"]);
@@ -667,7 +937,7 @@ fn configure_encoder(cmd: &mut Command, s: &Settings, nvenc: bool) {
         "+faststart",
     ]);
 }
-fn encoder_label(s: &Settings, nvenc: bool) -> String {
+fn encoder_label(s: &Settings, encoder: &str) -> String {
     let codec = if compressed(s) {
         "HEVC"
     } else if s.codec == "prores" && !s.preview {
@@ -675,7 +945,13 @@ fn encoder_label(s: &Settings, nvenc: bool) -> String {
     } else {
         "H.264"
     };
-    format!("{codec} · {}", if nvenc { "NVIDIA NVENC" } else { "CPU" })
+    let hw = match encoder {
+        "nvenc" => "NVIDIA NVENC",
+        "amf" => "AMD AMF",
+        "qsv" => "Intel QSV",
+        _ => "CPU",
+    };
+    format!("{codec} · {hw}")
 }
 fn blend_linear(a: &[u8], b: &[u8], t: f32, out: &mut Vec<u8>) {
     out.resize(a.len(), 0);
@@ -694,20 +970,8 @@ fn render_direct(
     meta: &Meta,
     clock: std::time::Instant,
 ) -> Result<Meta, String> {
-    let start = if s.preview { s.start } else { 0.0 };
-    let duration = if s.preview {
-        (meta.duration - start).min(s.preview_duration)
-    } else {
-        meta.duration
-    };
-    let nvenc = s.video_encoder == "nvenc" && (s.codec != "prores" || s.preview || compressed(s));
-    if nvenc {
-        if compressed(s) {
-            hevc_nvenc_availability()?;
-        } else {
-            nvenc_availability()?;
-        }
-    }
+    let (start, duration) = compute_window(s, meta);
+    let encoder_kind = resolve_encoder(s)?;
     let mut cmd = command("ffmpeg");
     cmd.args(["-y", "-v", "error", "-ss", &start.to_string(), "-i"])
         .arg(source)
@@ -730,13 +994,17 @@ fn render_direct(
     if w != meta.width || h != meta.height {
         filters.push(format!("scale={w}:{h}"));
     }
-    if !s.compress_only {
+    if !s.trim_only && !s.compress_only {
+        append_restore_pre_filters(&mut filters, s);
         let fps = s.fps.parse::<f64>().unwrap_or(meta.fps);
-        if fps > meta.fps + 0.1 {
+        if fps > meta.fps + 0.1 && s.interp_mode != "off" {
             filters.push("tpad=stop_mode=clone:stop_duration=0.1".into());
             filters.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"));
         } else if s.fps != "source" {
             filters.push(format!("fps={fps}"));
+        }
+        if s.restore_quality == "enhance" {
+            filters.push("cas=0.35".into());
         }
         if s.sharpness > 0.0 {
             filters.push(format!("unsharp=5:5:{}:5:5:0", s.sharpness));
@@ -754,7 +1022,7 @@ fn render_direct(
     if !s.preserve_audio {
         cmd.arg("-an");
     }
-    configure_encoder(&mut cmd, s, nvenc);
+    configure_encoder(&mut cmd, s, encoder_kind);
     let log_path = output.with_extension("encode.log");
     let log = File::create(&log_path).map_err(|e| e.to_string())?;
     let mut child = ManagedChild(
@@ -802,41 +1070,8 @@ fn render_direct(
     }
     let mut result = probe(output)?;
     result.processor = Some("FFmpeg · caminho direto".into());
-    result.encoder = Some(encoder_label(s, nvenc));
+    result.encoder = Some(encoder_label(s, encoder_kind));
     result.source_bytes = meta.bytes;
     result.render_seconds = clock.elapsed().as_secs_f64();
     Ok(result)
-}
-pub fn hevc_nvenc_availability() -> Result<(), String> {
-    static STATUS: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    STATUS
-        .get_or_init(|| {
-            let result = command("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "color=size=320x240:rate=30",
-                    "-frames:v",
-                    "1",
-                    "-c:v",
-                    "hevc_nvenc",
-                    "-f",
-                    "null",
-                    "-",
-                ])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if result.status.success() {
-                Ok(())
-            } else {
-                Err(
-                    "HEVC NVENC indisponível nesta GPU. Selecione encoder CPU para comprimir."
-                        .into(),
-                )
-            }
-        })
-        .clone()
 }

@@ -36,6 +36,9 @@ impl Config {
         self.settings.start = 0.0;
         self.settings.preview = false;
         self.settings.compress_only = false;
+        self.settings.trim_start = 0.0;
+        self.settings.trim_end = 0.0;
+        self.settings.trim_only = false;
         Ok(self)
     }
 }

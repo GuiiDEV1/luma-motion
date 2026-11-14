@@ -103,13 +103,37 @@ async fn health() -> Json<Value> {
     })
     .await
     .unwrap_or(false);
-    let (gpu, nvenc) =
-        tokio::task::spawn_blocking(|| (gpu::availability(), engine::nvenc_availability()))
-            .await
-            .unwrap_or_else(|e| (Err(e.to_string()), Err(e.to_string())));
-    Json(
-        json!({"ready":ready,"engine":"Rust · CPU / GPU", "gpu":{"ready":gpu.is_ok(),"name":gpu.as_ref().ok(),"error":gpu.as_ref().err()},"nvenc":{"ready":nvenc.is_ok(),"error":nvenc.err()}}),
-    )
+    let (gpu, nvenc, amf, qsv, realesrgan, rife) = tokio::task::spawn_blocking(|| {
+        (
+            gpu::availability(),
+            engine::encoder_availability("nvenc", false),
+            engine::encoder_availability("amf", false),
+            engine::encoder_availability("qsv", false),
+            engine::realesrgan_availability(),
+            engine::rife_availability(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            Err(e.to_string()),
+            Err(e.to_string()),
+            Err(e.to_string()),
+            Err(e.to_string()),
+            Err(e.to_string()),
+            Err(e.to_string()),
+        )
+    });
+    Json(json!({
+        "ready": ready,
+        "engine": "Rust · CPU / GPU",
+        "gpu": {"ready": gpu.is_ok(), "name": gpu.as_ref().ok(), "error": gpu.as_ref().err()},
+        "nvenc": {"ready": nvenc.is_ok(), "error": nvenc.err()},
+        "amf": {"ready": amf.is_ok(), "error": amf.err()},
+        "qsv": {"ready": qsv.is_ok(), "error": qsv.err()},
+        "realesrgan": {"ready": realesrgan.is_ok(), "error": realesrgan.err()},
+        "rife": {"ready": rife.is_ok(), "error": rife.err()}
+    }))
 }
 async fn upload(
     State(state): State<AppState>,

@@ -14,9 +14,13 @@ assert.equal(validate(legacy).settings.gamma,2.2);
 for(const key of ['gamma','gaussian_sigma','brightness','contrast','saturation','preview_duration']) assert.throws(()=>validate({...input,settings:{...input.settings,[key]:NaN}}));
 for(const weighting of ['gaussian','gaussian_bound','vegas','uniform','pyramid','ascending','descending']) assert.equal(validate({...input,settings:{...input.settings,weighting}}).settings.weighting,weighting);
 
-assert.equal(validate(legacy).settings.processing,'cpu');assert.equal(validate(legacy).settings.video_encoder,'cpu');
-for(const processing of ['cpu','gpu']) for(const video_encoder of ['cpu','nvenc']) assert.equal(validate({...input,settings:{...input.settings,processing,video_encoder}}).settings.video_encoder,video_encoder);
-for(const key of ['processing','video_encoder']) assert.throws(()=>validate({...input,settings:{...input.settings,[key]:'bad'}}));
+assert.equal(validate(legacy).settings.processing,'cpu');assert.equal(validate(legacy).settings.video_encoder,'auto');
+assert.equal(validate(legacy).settings.interp_mode,'auto');assert.equal(validate(legacy).settings.restore_quality,'off');
+for(const processing of ['cpu','gpu']) for(const video_encoder of ['auto','cpu','nvenc','amf','qsv']) assert.equal(validate({...input,settings:{...input.settings,processing,video_encoder}}).settings.video_encoder,video_encoder);
+for(const interp_mode of ['auto','gpu','ffmpeg','off']) assert.equal(validate({...input,settings:{...input.settings,interp_mode}}).settings.interp_mode,interp_mode);
+for(const restore_quality of ['off','deblock','enhance','ai_2x']) assert.equal(validate({...input,settings:{...input.settings,restore_quality}}).settings.restore_quality,restore_quality);
+for(const fps of ['source','24','60','90','144','240']) assert.equal(validate({...input,settings:{...input.settings,fps}}).settings.fps,fps);
+for(const key of ['processing','video_encoder','interp_mode','restore_quality','fps']) assert.throws(()=>validate({...input,settings:{...input.settings,[key]:'bad'}}));
 
 for(const compression_mode of ['quality','aggressive'])assert.equal(validate({...input,settings:{...input.settings,compression_enabled:true,compression_mode}}).settings.compression_mode,compression_mode);
 assert.equal(validate(legacy).settings.compression_enabled,false);
@@ -25,7 +29,10 @@ assert.equal(validate(legacy).settings.vector_smoothing,true);
 assert.equal(validate(legacy).settings.dehalo,true);
 assert.equal(validate(legacy).settings.hud_protect,true);
 assert.equal(validate(legacy).settings.subframe_blend,true);
-for(const samples of [5,9,15,24,32]) assert.equal(validate({...input,settings:{...input.settings,samples}}).settings.samples,samples);
+for(const samples of [3,5,9,15,24,32,48,64]) assert.equal(validate({...input,settings:{...input.settings,samples}}).settings.samples,samples);
+for(const analysis_width of [240,480,720,1080,1280]) assert.equal(validate({...input,settings:{...input.settings,analysis_width}}).settings.analysis_width,analysis_width);
+for(const search_radius of [4,16,32,48]) assert.equal(validate({...input,settings:{...input.settings,search_radius}}).settings.search_radius,search_radius);
+for(const crf of [0,18,40]) assert.equal(validate({...input,settings:{...input.settings,crf}}).settings.crf,crf);
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_mode:'fake'}}));
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_enabled:'yes'}}));
 assert.throws(()=>validate({...input,settings:{...input.settings,deduplicate:'yes'}}));
