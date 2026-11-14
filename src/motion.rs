@@ -8,16 +8,20 @@ pub struct Vector {
     pub confidence: f32,
 }
 
-fn gray(frame: &[u8], w: usize, h: usize, gw: usize, gh: usize) -> Vec<u8> {
+fn gray_strided(frame: &[u8], w: usize, h: usize, gw: usize, gh: usize, stride: usize) -> Vec<u8> {
     (0..gw * gh)
         .map(|i| {
             let x = (i % gw) * w / gw;
             let y = (i / gw) * h / gh;
-            let p = (y * w + x) * 3;
+            let p = (y * w + x) * stride;
             ((frame[p] as u32 * 19 + frame[p + 1] as u32 * 183 + frame[p + 2] as u32 * 54) / 256)
                 as u8
         })
         .collect()
+}
+
+fn gray(frame: &[u8], w: usize, h: usize, gw: usize, gh: usize) -> Vec<u8> {
+    gray_strided(frame, w, h, gw, gh, 3)
 }
 
 // Coordinates are explicit in this hot-path image primitive.
@@ -154,9 +158,27 @@ fn field(
             } else {
                 1.0
             };
+            // Parabolic sub-pixel refinement around (dx, dy)
+            let s_center = sad(current, previous, w, h, x, y, dx, dy);
+            let s_left = sad(current, previous, w, h, x, y, dx - 1, dy);
+            let s_right = sad(current, previous, w, h, x, y, dx + 1, dy);
+            let s_up = sad(current, previous, w, h, x, y, dx, dy - 1);
+            let s_down = sad(current, previous, w, h, x, y, dx, dy + 1);
+            let denom_x = 2.0 * (s_left + s_right - 2.0 * s_center);
+            let denom_y = 2.0 * (s_up + s_down - 2.0 * s_center);
+            let sub_x = if denom_x > 0.01 {
+                ((s_left - s_right) / denom_x).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            let sub_y = if denom_y > 0.01 {
+                ((s_up - s_down) / denom_y).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
             Vector {
-                x: dx as f32,
-                y: dy as f32,
+                x: dx as f32 + sub_x,
+                y: dy as f32 + sub_y,
                 confidence,
             }
         })
@@ -265,11 +287,18 @@ pub fn sample_weights(mode: &str, sigma: f32, samples: usize) -> Vec<f32> {
     }
     weights
 }
-pub fn frame_difference(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> f32 {
+pub fn frame_difference_strided(
+    previous: &[u8],
+    current: &[u8],
+    w: usize,
+    h: usize,
+    width: usize,
+    stride: usize,
+) -> f32 {
     let gw = w.min(width);
     let gh = (h * gw / w).max(1);
-    let a = gray(current, w, h, gw, gh);
-    let b = gray(previous, w, h, gw, gh);
+    let a = gray_strided(current, w, h, gw, gh, stride);
+    let b = gray_strided(previous, w, h, gw, gh, stride);
     a.iter()
         .zip(&b)
         .map(|(a, b)| a.abs_diff(*b) as f32)
@@ -277,10 +306,24 @@ pub fn frame_difference(previous: &[u8], current: &[u8], w: usize, h: usize, wid
         / a.len() as f32
 }
 pub fn is_scene_cut(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
-    frame_difference(previous, current, w, h, width) > 65.0
+    frame_difference_strided(previous, current, w, h, width, 3) > 65.0
 }
+pub fn is_scene_cut_bgra(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
+    frame_difference_strided(previous, current, w, h, width, 4) > 65.0
+}
+pub fn is_duplicate_frame_strided(
+    previous: &[u8],
+    current: &[u8],
+    w: usize,
+    h: usize,
+    width: usize,
+    stride: usize,
+) -> bool {
+    frame_difference_strided(previous, current, w, h, width, stride) < 0.6
+}
+#[cfg(test)]
 pub fn is_duplicate_frame(previous: &[u8], current: &[u8], w: usize, h: usize, width: usize) -> bool {
-    frame_difference(previous, current, w, h, width) < 0.6
+    is_duplicate_frame_strided(previous, current, w, h, width, 3)
 }
 fn ign(x: usize, y: usize) -> f32 {
     let v = (0.06711056 * x as f32 + 0.00583715 * y as f32).fract();
@@ -295,6 +338,7 @@ pub struct MotionEngine {
     sigma: f32,
     vector_smoothing: bool,
     dehalo: bool,
+    hud_protect: bool,
 }
 impl MotionEngine {
     #[cfg(test)]
@@ -306,6 +350,7 @@ impl MotionEngine {
             sigma: 0.65,
             vector_smoothing: true,
             dehalo: true,
+            hud_protect: true,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / 2.2) * 255.0).round() as u8)
@@ -314,8 +359,9 @@ impl MotionEngine {
     }
     #[cfg(test)]
     pub fn configured(width: usize, radius: i32, weighting: &str, gamma: f32, sigma: f32) -> Self {
-        Self::configured_full(width, radius, weighting, gamma, sigma, true, true)
+        Self::configured_full(width, radius, weighting, gamma, sigma, true, true, true)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn configured_full(
         width: usize,
         radius: i32,
@@ -324,6 +370,7 @@ impl MotionEngine {
         sigma: f32,
         vector_smoothing: bool,
         dehalo: bool,
+        hud_protect: bool,
     ) -> Self {
         Self {
             analysis_width: width,
@@ -332,17 +379,33 @@ impl MotionEngine {
             sigma,
             vector_smoothing,
             dehalo,
+            hud_protect,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(gamma)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / gamma) * 255.0).round() as u8)
                 .collect(),
         }
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         previous: Option<&[u8]>,
         current: &[u8],
+        w: usize,
+        h: usize,
+        shutter: u32,
+        samples: usize,
+        protect: bool,
+    ) -> Vec<u8> {
+        self.apply_with_next(previous, current, None, w, h, shutter, samples, protect)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_next(
+        &self,
+        previous: Option<&[u8]>,
+        current: &[u8],
+        next: Option<&[u8]>,
         w: usize,
         h: usize,
         shutter: u32,
@@ -376,6 +439,16 @@ impl MotionEngine {
         } else {
             raw_vectors
         };
+        let next_valid = next.filter(|n| !protect || !is_scene_cut(current, n, w, h, self.analysis_width));
+        let next_vectors = next_valid.map(|n| {
+            let c = gray(n, w, h, gw, gh);
+            let raw = field(&a, &c, gw, gh, fw, fh, protect, self.search_radius);
+            if self.vector_smoothing {
+                smooth_vectors(&raw, fw, fh)
+            } else {
+                raw
+            }
+        });
         let weights = sample_weights(&self.weighting, self.sigma, samples);
         let scale = w as f32 / gw as f32;
         let mut output = vec![0u8; current.len()];
@@ -392,6 +465,29 @@ impl MotionEngine {
                     }
                     let vx = (vector.x * scale).clamp(-160.0, 160.0);
                     let vy = (vector.y * scale).clamp(-160.0, 160.0);
+                    let mut conf = vector.confidence;
+                    if self.hud_protect && (vx.abs() + vy.abs()) > 1.5 {
+                        let d_prev = u32::from(current[p].abs_diff(previous[p]))
+                            + u32::from(current[p + 1].abs_diff(previous[p + 1]))
+                            + u32::from(current[p + 2].abs_diff(previous[p + 2]));
+                        if d_prev <= 6 {
+                            conf *= 0.08;
+                        }
+                    }
+                    let (fx, fy) = if let Some(ref nv) = next_vectors {
+                        let v_next = vector_at(nv, fw, fh, x as f32 / scale, y as f32 / scale);
+                        // Forward-backward consistency: if forward and backward agree, boost; if occluded, dampen
+                        let consistency_err = ((vector.x + v_next.x).powi(2) + (vector.y + v_next.y).powi(2)).sqrt();
+                        if protect && consistency_err > 6.0 {
+                            conf *= (1.0 - (consistency_err - 6.0) / 14.0).clamp(0.15, 1.0);
+                        }
+                        (
+                            (-v_next.x * scale).clamp(-160.0, 160.0),
+                            (-v_next.y * scale).clamp(-160.0, 160.0),
+                        )
+                    } else {
+                        (vx, vy)
+                    };
                     let center_lin = [
                         self.linear[current[p] as usize],
                         self.linear[current[p + 1] as usize],
@@ -405,8 +501,6 @@ impl MotionEngine {
                     for (i, weight) in weights.iter().enumerate() {
                         let base_t = i as f32 / (samples - 1) as f32 - 0.5;
                         let t = (base_t + jitter).clamp(-0.5, 0.5) * shutter as f32 / 360.0;
-                        // Bidirectional sampling: use previous frame for negative shutter offsets
-                        // when t < 0, blending smoothly with current.
                         let color = if t < 0.0 {
                             sample(
                                 previous,
@@ -414,6 +508,15 @@ impl MotionEngine {
                                 h,
                                 x as f32 + vx * (t + 1.0),
                                 y as f32 + vy * (t + 1.0),
+                                &self.linear,
+                            )
+                        } else if let Some(n) = next_valid {
+                            sample(
+                                n,
+                                w,
+                                h,
+                                x as f32 - fx * (1.0 - t),
+                                y as f32 - fy * (1.0 - t),
                                 &self.linear,
                             )
                         } else {
@@ -443,8 +546,7 @@ impl MotionEngine {
                     let inv = if w_sum > 0.0 { 1.0 / w_sum } else { 1.0 };
                     for c in 0..3 {
                         let blurred = integrated[c] * inv;
-                        let value = blurred * vector.confidence
-                            + center_lin[c] * (1.0 - vector.confidence);
+                        let value = blurred * conf + center_lin[c] * (1.0 - conf);
                         pixel[c] = self.encoded[(value.clamp(0.0, 1.0) * 4096.0).round() as usize];
                     }
                 }
@@ -544,5 +646,31 @@ mod tests {
         let out32 = MotionEngine::new().apply(Some(&a), &b, 96, 64, 360, 32, true);
         assert_ne!(out24, b);
         assert_ne!(out32, b);
+    }
+    #[test]
+    fn three_frame_symmetric_and_hud_protection() {
+        let mut a = vec![20; 96 * 64 * 3];
+        let mut b = a.clone();
+        let mut c = a.clone();
+        for y in 12..50 {
+            for x in 20..50 {
+                for ch in 0..3 {
+                    a[(y * 96 + x) * 3 + ch] = 220;
+                    b[(y * 96 + x + 6) * 3 + ch] = 220;
+                    c[(y * 96 + x + 12) * 3 + ch] = 220;
+                }
+            }
+        }
+        // Static bright HUD crosshair in the center (identical across a, b, c)
+        for ch in 0..3 {
+            a[(32 * 96 + 48) * 3 + ch] = 255;
+            b[(32 * 96 + 48) * 3 + ch] = 255;
+            c[(32 * 96 + 48) * 3 + ch] = 255;
+        }
+        let engine = MotionEngine::new();
+        let out = engine.apply_with_next(Some(&a), &b, Some(&c), 96, 64, 360, 15, true);
+        assert_ne!(out, b);
+        // Static HUD pixel should stay near 255 despite surrounding motion
+        assert!(out[(32 * 96 + 48) * 3] > 235);
     }
 }

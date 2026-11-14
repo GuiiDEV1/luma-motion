@@ -23,6 +23,7 @@ assert.equal(validate(legacy).settings.compression_enabled,false);
 assert.equal(validate(legacy).settings.deduplicate,true);
 assert.equal(validate(legacy).settings.vector_smoothing,true);
 assert.equal(validate(legacy).settings.dehalo,true);
+assert.equal(validate(legacy).settings.hud_protect,true);
 for(const samples of [5,9,15,24,32]) assert.equal(validate({...input,settings:{...input.settings,samples}}).settings.samples,samples);
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_mode:'fake'}}));
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_enabled:'yes'}}));

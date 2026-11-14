@@ -35,6 +35,7 @@ pub struct GpuMotion {
     interpolate: wgpu::ComputePipeline,
     previous: wgpu::Buffer,
     current: wgpu::Buffer,
+    next_frame: wgpu::Buffer,
     params: wgpu::Buffer,
     output: wgpu::Buffer,
     readback: wgpu::Buffer,
@@ -97,6 +98,11 @@ impl GpuMotion {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         );
+        let next_frame = buffer(
+            "next_frame",
+            size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let output = buffer(
             "output",
             size,
@@ -126,12 +132,13 @@ impl GpuMotion {
             (fw * fh * 16) as u64,
             wgpu::BufferUsages::STORAGE,
         );
-        let linear: Vec<f32> = (0..256)
-            .map(|i| (i as f32 / 255.0).powf(settings.gamma))
-            .collect();
-        let encoded: Vec<u32> = (0..=4096)
-            .map(|i| ((i as f32 / 4096.0).powf(1.0 / settings.gamma) * 255.0).round() as u32)
-            .collect();
+        let mut lut_data = Vec::with_capacity(256 + 4097);
+        for i in 0..256 {
+            lut_data.push((i as f32 / 255.0).powf(settings.gamma).to_bits());
+        }
+        for i in 0..=4096 {
+            lut_data.push(((i as f32 / 4096.0).powf(1.0 / settings.gamma) * 255.0).round() as u32);
+        }
         let weights = motion::sample_weights(
             &settings.weighting,
             settings.gaussian_sigma,
@@ -144,8 +151,7 @@ impl GpuMotion {
                 usage: wgpu::BufferUsages::STORAGE,
             })
         };
-        let linear = table("linear", bytemuck::cast_slice(&linear));
-        let encoded = table("encoded", bytemuck::cast_slice(&encoded));
+        let lut = table("lut", bytemuck::cast_slice(&lut_data));
         let weights = table("weights", bytemuck::cast_slice(&weights));
         let entries: Vec<_> = (0..9)
             .map(|binding| wgpu::BindGroupLayoutEntry {
@@ -174,8 +180,8 @@ impl GpuMotion {
             &current,
             &vectors,
             &output,
-            &linear,
-            &encoded,
+            &lut,
+            &next_frame,
             &params,
             &weights,
             &vectors_smooth,
@@ -229,6 +235,7 @@ impl GpuMotion {
             interpolate,
             previous,
             current,
+            next_frame,
             params,
             output,
             readback,
@@ -256,6 +263,16 @@ impl GpuMotion {
         current: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<(), String> {
+        self.apply_with_next_into(previous, current, None, output)
+    }
+
+    pub fn apply_with_next_into(
+        &mut self,
+        previous: Option<&[u8]>,
+        current: &[u8],
+        next: Option<&[u8]>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
         let Some(previous) = previous else {
             self.previous_ready = false;
             output.clear();
@@ -271,12 +288,58 @@ impl GpuMotion {
             output.extend_from_slice(current);
             return Ok(());
         }
-        self.run_passes(previous, current, None, false, output)
+        let next_valid = next.filter(|n| {
+            !s.protection
+                || !motion::is_scene_cut(current, n, self.width, self.height, s.analysis_width)
+        });
+        self.run_passes(previous, current, next_valid, None, false, false, output)
+    }
+
+    pub fn apply_bgra_into(
+        &mut self,
+        previous: Option<&[u8]>,
+        current: &[u8],
+        next: Option<&[u8]>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let Some(previous) = previous else {
+            self.previous_ready = false;
+            output.clear();
+            output.extend_from_slice(current);
+            return Ok(());
+        };
+        let s = &self.settings;
+        let cut = s.protection
+            && motion::is_scene_cut_bgra(
+                previous,
+                current,
+                self.width,
+                self.height,
+                s.analysis_width,
+            );
+        if s.shutter == 0 || cut {
+            self.previous_ready = false;
+            output.clear();
+            output.extend_from_slice(current);
+            return Ok(());
+        }
+        let next_valid = next.filter(|n| {
+            !s.protection
+                || !motion::is_scene_cut_bgra(
+                    current,
+                    n,
+                    self.width,
+                    self.height,
+                    s.analysis_width,
+                )
+        });
+        self.run_passes(previous, current, next_valid, None, false, true, output)
     }
 
     /// Synthesizes an intermediate frame at `t` in `(0.0, 1.0)` between `previous` and `current`.
     /// Does not advance `previous` in streaming mode so the caller can generate multiple sub-frames
     /// from the same pair before advancing.
+    #[allow(dead_code)]
     pub fn interpolate_into(
         &mut self,
         previous: &[u8],
@@ -292,15 +355,36 @@ impl GpuMotion {
                 self.height,
                 self.settings.analysis_width,
             );
-        self.run_passes(previous, current, Some(t), cut, output)
+        self.run_passes(previous, current, None, Some(t), cut, false, output)
     }
 
+    pub fn interpolate_bgra_into(
+        &mut self,
+        previous: &[u8],
+        current: &[u8],
+        t: f32,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let cut = self.settings.protection
+            && motion::is_scene_cut_bgra(
+                previous,
+                current,
+                self.width,
+                self.height,
+                self.settings.analysis_width,
+            );
+        self.run_passes(previous, current, None, Some(t), cut, true, output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_passes(
         &mut self,
         previous: &[u8],
         current: &[u8],
+        next: Option<&[u8]>,
         interp_t: Option<f32>,
         cut: bool,
+        is_bgra: bool,
         output: &mut Vec<u8>,
     ) -> Result<(), String> {
         let s = &self.settings;
@@ -319,16 +403,35 @@ impl GpuMotion {
                 });
         };
         if !self.streaming || !self.previous_ready {
-            pack(previous, &mut self.packed);
-            self.queue
-                .write_buffer(&self.previous, 0, bytemuck::cast_slice(&self.packed));
+            if is_bgra {
+                self.queue.write_buffer(&self.previous, 0, previous);
+            } else {
+                pack(previous, &mut self.packed);
+                self.queue
+                    .write_buffer(&self.previous, 0, bytemuck::cast_slice(&self.packed));
+            }
         }
-        pack(current, &mut self.packed);
-        self.queue
-            .write_buffer(&self.current, 0, bytemuck::cast_slice(&self.packed));
+        if is_bgra {
+            self.queue.write_buffer(&self.current, 0, current);
+        } else {
+            pack(current, &mut self.packed);
+            self.queue
+                .write_buffer(&self.current, 0, bytemuck::cast_slice(&self.packed));
+        }
+        if let Some(next_buf) = next {
+            if is_bgra {
+                self.queue.write_buffer(&self.next_frame, 0, next_buf);
+            } else {
+                pack(next_buf, &mut self.packed);
+                self.queue
+                    .write_buffer(&self.next_frame, 0, bytemuck::cast_slice(&self.packed));
+            }
+        }
         let flags = u32::from(s.vector_smoothing)
             | (u32::from(s.dehalo) << 1)
-            | (u32::from(true) << 2);
+            | (u32::from(true) << 2)
+            | (u32::from(next.is_some()) << 3)
+            | (u32::from(s.hud_protect) << 4);
         let params = Params {
             w: self.width as u32,
             h: self.height as u32,
@@ -434,10 +537,14 @@ impl GpuMotion {
             .map_err(|e| format!("Leitura da GPU falhou: {e}"))?;
         let bytes = slice.get_mapped_range();
         output.resize(current.len(), 0);
-        output
-            .par_chunks_exact_mut(3)
-            .zip(bytes.par_chunks_exact(4))
-            .for_each(|(out, pixel)| out.copy_from_slice(&pixel[..3]));
+        if is_bgra {
+            output.copy_from_slice(&bytes);
+        } else {
+            output
+                .par_chunks_exact_mut(3)
+                .zip(bytes.par_chunks_exact(4))
+                .for_each(|(out, pixel)| out.copy_from_slice(&pixel[..3]));
+        }
         drop(bytes);
         self.readback.unmap();
         if interp_t.is_none() {
