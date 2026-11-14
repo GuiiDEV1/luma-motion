@@ -431,7 +431,8 @@ impl GpuMotion {
             | (u32::from(s.dehalo) << 1)
             | (u32::from(true) << 2)
             | (u32::from(next.is_some()) << 3)
-            | (u32::from(s.hud_protect) << 4);
+            | (u32::from(s.hud_protect) << 4)
+            | (u32::from(s.subframe_blend) << 5);
         let params = Params {
             w: self.width as u32,
             h: self.height as u32,

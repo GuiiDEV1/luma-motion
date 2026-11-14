@@ -12,7 +12,7 @@ console.log('Configuration roundtrip, sanitization and invalid-file tests passed
 const legacy=JSON.parse(require('node:fs').readFileSync('examples/gameplay-60.luma.json','utf8'));
 assert.equal(validate(legacy).settings.gamma,2.2);
 for(const key of ['gamma','gaussian_sigma','brightness','contrast','saturation','preview_duration']) assert.throws(()=>validate({...input,settings:{...input.settings,[key]:NaN}}));
-for(const weighting of ['gaussian','uniform','pyramid','ascending','descending']) assert.equal(validate({...input,settings:{...input.settings,weighting}}).settings.weighting,weighting);
+for(const weighting of ['gaussian','gaussian_bound','vegas','uniform','pyramid','ascending','descending']) assert.equal(validate({...input,settings:{...input.settings,weighting}}).settings.weighting,weighting);
 
 assert.equal(validate(legacy).settings.processing,'cpu');assert.equal(validate(legacy).settings.video_encoder,'cpu');
 for(const processing of ['cpu','gpu']) for(const video_encoder of ['cpu','nvenc']) assert.equal(validate({...input,settings:{...input.settings,processing,video_encoder}}).settings.video_encoder,video_encoder);
@@ -24,6 +24,7 @@ assert.equal(validate(legacy).settings.deduplicate,true);
 assert.equal(validate(legacy).settings.vector_smoothing,true);
 assert.equal(validate(legacy).settings.dehalo,true);
 assert.equal(validate(legacy).settings.hud_protect,true);
+assert.equal(validate(legacy).settings.subframe_blend,true);
 for(const samples of [5,9,15,24,32]) assert.equal(validate({...input,settings:{...input.settings,samples}}).settings.samples,samples);
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_mode:'fake'}}));
 assert.throws(()=>validate({...input,settings:{...input.settings,compression_enabled:'yes'}}));

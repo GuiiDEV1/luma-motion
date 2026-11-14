@@ -185,13 +185,27 @@ fn field(
         .collect()
 }
 
-fn smooth_vectors(vectors: &[Vector], fw: usize, fh: usize) -> Vec<Vector> {
+fn block_luma(gray_curr: &[u8], gw: usize, gh: usize, bx: usize, by: usize) -> f32 {
+    let x = (bx * 8).min(gw - 1);
+    let y = (by * 8).min(gh - 1);
+    gray_curr[y * gw + x] as f32
+}
+
+fn smooth_vectors(
+    vectors: &[Vector],
+    gray_curr: &[u8],
+    gw: usize,
+    gh: usize,
+    fw: usize,
+    fh: usize,
+) -> Vec<Vector> {
     (0..fw * fh)
         .into_par_iter()
         .map(|i| {
             let x = (i % fw) as isize;
             let y = (i / fw) as isize;
             let center = vectors[i];
+            let center_l = block_luma(gray_curr, gw, gh, x as usize, y as usize);
             let mut sum_x = center.x * (center.confidence + 0.05) * 2.0;
             let mut sum_y = center.y * (center.confidence + 0.05) * 2.0;
             let mut sum_c = center.confidence * 2.0;
@@ -205,7 +219,10 @@ fn smooth_vectors(vectors: &[Vector], fw: usize, fh: usize) -> Vec<Vector> {
                     let nx = (x + dx).clamp(0, fw as isize - 1) as usize;
                     let ny = (y + dy).clamp(0, fh as isize - 1) as usize;
                     let n = vectors[ny * fw + nx];
-                    let w = n.confidence + 0.05;
+                    let nl = block_luma(gray_curr, gw, gh, nx, ny);
+                    let dl = center_l - nl;
+                    let edge_w = (-dl * dl / 400.0).exp().max(0.08);
+                    let w = (n.confidence + 0.05) * edge_w;
                     sum_x += n.x * w;
                     sum_y += n.y * w;
                     sum_c += n.confidence;
@@ -277,6 +294,13 @@ pub fn sample_weights(mode: &str, sigma: f32, samples: usize) -> Vec<f32> {
                 "pyramid" => (1.0 - t.abs()).max(0.01),
                 "ascending" => (t + 1.0) / 2.0 + 0.01,
                 "descending" => (1.0 - t) / 2.0 + 0.01,
+                "vegas" => (0.5 * (1.0 + (t * std::f32::consts::PI).cos()))
+                    .powf(1.2)
+                    .max(0.01),
+                "gaussian_bound" => {
+                    let s = sigma.max(0.15);
+                    ((-0.5 * (t / s).powi(2)).exp() - (-0.5 / (s * s)).exp()).max(0.01)
+                }
                 _ => (-0.5 * (t / sigma).powi(2)).exp(),
             }
         })
@@ -339,6 +363,7 @@ pub struct MotionEngine {
     vector_smoothing: bool,
     dehalo: bool,
     hud_protect: bool,
+    subframe_blend: bool,
 }
 impl MotionEngine {
     #[cfg(test)]
@@ -351,6 +376,7 @@ impl MotionEngine {
             vector_smoothing: true,
             dehalo: true,
             hud_protect: true,
+            subframe_blend: true,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / 2.2) * 255.0).round() as u8)
@@ -359,7 +385,7 @@ impl MotionEngine {
     }
     #[cfg(test)]
     pub fn configured(width: usize, radius: i32, weighting: &str, gamma: f32, sigma: f32) -> Self {
-        Self::configured_full(width, radius, weighting, gamma, sigma, true, true, true)
+        Self::configured_full(width, radius, weighting, gamma, sigma, true, true, true, true)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn configured_full(
@@ -371,6 +397,7 @@ impl MotionEngine {
         vector_smoothing: bool,
         dehalo: bool,
         hud_protect: bool,
+        subframe_blend: bool,
     ) -> Self {
         Self {
             analysis_width: width,
@@ -380,6 +407,7 @@ impl MotionEngine {
             vector_smoothing,
             dehalo,
             hud_protect,
+            subframe_blend,
             linear: std::array::from_fn(|i| (i as f32 / 255.0).powf(gamma)),
             encoded: (0..=4096)
                 .map(|i| ((i as f32 / 4096.0).powf(1.0 / gamma) * 255.0).round() as u8)
@@ -435,7 +463,7 @@ impl MotionEngine {
         let fh = gh.div_ceil(8);
         let raw_vectors = field(&a, &b, gw, gh, fw, fh, protect, self.search_radius);
         let vectors = if self.vector_smoothing {
-            smooth_vectors(&raw_vectors, fw, fh)
+            smooth_vectors(&raw_vectors, &a, gw, gh, fw, fh)
         } else {
             raw_vectors
         };
@@ -444,7 +472,7 @@ impl MotionEngine {
             let c = gray(n, w, h, gw, gh);
             let raw = field(&a, &c, gw, gh, fw, fh, protect, self.search_radius);
             if self.vector_smoothing {
-                smooth_vectors(&raw, fw, fh)
+                smooth_vectors(&raw, &a, gw, gh, fw, fh)
             } else {
                 raw
             }
@@ -501,7 +529,49 @@ impl MotionEngine {
                     for (i, weight) in weights.iter().enumerate() {
                         let base_t = i as f32 / (samples - 1) as f32 - 0.5;
                         let t = (base_t + jitter).clamp(-0.5, 0.5) * shutter as f32 / 360.0;
-                        let color = if t < 0.0 {
+                        let color = if self.subframe_blend {
+                            let curr_s = sample(
+                                current,
+                                w,
+                                h,
+                                x as f32 + vx * t,
+                                y as f32 + vy * t,
+                                &self.linear,
+                            );
+                            if t < 0.0 {
+                                let prev_s = sample(
+                                    previous,
+                                    w,
+                                    h,
+                                    x as f32 + vx * (t + 1.0),
+                                    y as f32 + vy * (t + 1.0),
+                                    &self.linear,
+                                );
+                                let m = (-t * 2.0).clamp(0.0, 1.0);
+                                [
+                                    curr_s[0] * (1.0 - m) + prev_s[0] * m,
+                                    curr_s[1] * (1.0 - m) + prev_s[1] * m,
+                                    curr_s[2] * (1.0 - m) + prev_s[2] * m,
+                                ]
+                            } else if let Some(n) = next_valid {
+                                let next_s = sample(
+                                    n,
+                                    w,
+                                    h,
+                                    x as f32 - fx * (1.0 - t),
+                                    y as f32 - fy * (1.0 - t),
+                                    &self.linear,
+                                );
+                                let m = (t * 2.0).clamp(0.0, 1.0);
+                                [
+                                    curr_s[0] * (1.0 - m) + next_s[0] * m,
+                                    curr_s[1] * (1.0 - m) + next_s[1] * m,
+                                    curr_s[2] * (1.0 - m) + next_s[2] * m,
+                                ]
+                            } else {
+                                curr_s
+                            }
+                        } else if t < 0.0 {
                             sample(
                                 previous,
                                 w,

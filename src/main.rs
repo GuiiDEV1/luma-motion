@@ -512,8 +512,65 @@ fn router(data: &std::path::Path) -> (Router, Arc<Mutex<HashMap<String, Job>>>) 
         .with_state(state);
     (router, jobs)
 }
+fn run_cli(args: &[String]) -> Result<(), String> {
+    let input = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .ok_or("Uso: luma-motion render <video> [--output <saida>] [--preset <arquivo.luma.json>] [--gpu] [--nvenc]")?;
+    let source = PathBuf::from(input);
+    let mut output: Option<PathBuf> = None;
+    let mut settings = Settings::default();
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" | "-o" => {
+                i += 1;
+                output = Some(PathBuf::from(args.get(i).ok_or("Falta o caminho após --output.")?));
+            }
+            "--preset" | "-p" => {
+                i += 1;
+                let preset_path = args.get(i).ok_or("Falta o caminho após --preset.")?;
+                let bytes = std::fs::read(preset_path).map_err(|e| e.to_string())?;
+                let cfg: config::Config = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                settings = cfg.validated()?.settings;
+            }
+            "--gpu" => settings.processing = "gpu".into(),
+            "--nvenc" => settings.video_encoder = "nvenc".into(),
+            other => return Err(format!("Argumento desconhecido: {other}")),
+        }
+        i += 1;
+    }
+    let ext = if settings.codec == "prores" && !settings.compression_enabled {
+        "mov"
+    } else {
+        "mp4"
+    };
+    let out_path = output.unwrap_or_else(|| {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        source.with_file_name(format!("{stem}-luma.{ext}"))
+    });
+    let cancel = Arc::new(AtomicBool::new(false));
+    let meta = engine::render(&source, &out_path, &settings, cancel, |pct| {
+        eprint!("\rLuma Motion CLI · {pct:.0}%");
+    })?;
+    eprintln!(
+        "\rLuma Motion CLI · concluído em {:.2}s -> {}",
+        meta.render_seconds,
+        out_path.display()
+    );
+    Ok(())
+}
+
 fn main() {
-    let web = std::env::args().any(|a| a == "--web");
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "render") {
+        if let Err(err) = run_cli(&args) {
+            eprintln!("Erro: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let web = args.iter().any(|a| a == "--web");
     let data = if web {
         std::env::current_dir().unwrap()
     } else {

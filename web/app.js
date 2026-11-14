@@ -5,6 +5,25 @@ const formatTime = value => { const n = Number.isFinite(value) ? value : 0; retu
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 6000); }
 async function api(url, options) { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Confira os ajustes e tente novamente.'); return data; }
 function lock(value) { locked = value; ['preview','export','compress','add-queue'].forEach(id => $(id).disabled = value || !media); ['import-top','import-empty','file'].forEach(id => $(id).disabled = value); if ($('run-queue')) $('run-queue').disabled = value || !queue.length; }
+let zoomLevel = 1;
+if ($('zoom-btn')) {
+  $('zoom-btn').onclick = () => {
+    zoomLevel = zoomLevel === 1 ? 2 : zoomLevel === 2 ? 4 : 1;
+    $('zoom-btn').textContent = zoomLevel + '×';
+    $('zoom-btn').classList.toggle('active', zoomLevel > 1);
+    const scale = `scale(${zoomLevel})`;
+    original.style.transform = scale;
+    result.style.transform = scale;
+  };
+  $('dropzone').addEventListener('pointermove', e => {
+    if (zoomLevel === 1) return;
+    const r = $('dropzone').getBoundingClientRect();
+    const ox = ((e.clientX - r.left) / r.width * 100).toFixed(1) + '%';
+    const oy = ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%';
+    original.style.transformOrigin = `${ox} ${oy}`;
+    result.style.transformOrigin = `${ox} ${oy}`;
+  });
+}
 async function pickDesktopFile() {
   if (locked) return;
   lock(true); window.lumaFeedback?.('import','running');
@@ -30,7 +49,7 @@ function applyMedia(nextMedia) {
   $('source-tag').textContent = `${Math.round(media.fps)} FPS`; $('start').max = Math.max(0, media.duration - .1);
   $('start').value = 0; $('job-box').hidden = true;
   document.querySelectorAll('[data-view]').forEach(button => button.disabled = button.dataset.view !== 'original');
-  ['play','seek','mute'].forEach(id => $(id).disabled = false); setView('original');
+  ['play','seek','mute','zoom-btn'].forEach(id => { if ($(id)) $(id).disabled = false; }); setView('original');
   window.lumaFeedback?.('import','done'); toast('Vídeo pronto. Escolha um preset e teste uma prévia.');
 }
 async function loadFile(file) {
@@ -46,12 +65,33 @@ document.querySelectorAll('[data-preset]').forEach(button => button.onclick = ()
   const preset = presets[button.dataset.preset]; Object.entries(preset).forEach(([key,value]) => $(key).value = value);
   $('protection').checked = true; document.querySelectorAll('[data-preset]').forEach(b => b.classList.toggle('active', b === button)); updateLabels(); markStale();
 });
-function updateLabels() {$('compression-hint').textContent=$('compression_mode').value==='aggressive'?'HEVC com compressão forte: prioriza tamanho, com perda visível em detalhes e movimentos. Mantém resolução e FPS.':'HEVC com alta fidelidade: prioriza preservar detalhes com perda visual mínima. Não é sem perdas; o tamanho depende do vídeo.';$('engine-badge').textContent='FLOW / '+$('processing').value.toUpperCase();window.updateSummary?.();$('preview').innerHTML=icon('play')+' Testar '+$('preview_duration').value+' segundos';$('preview-tag').textContent='PRÉVIA · ATÉ '+$('preview_duration').value+' SEGUNDOS'; $('shutter-value').textContent = `${$('shutter').value}°`; $('sharpness-value').textContent = `${$('sharpness').value}%`; }
+function updateWeightCurve() {
+  const path = $('weight-path');
+  if (!path) return;
+  const mode = $('weighting').value, sigma = Math.max(0.15, +$('gaussian_sigma').value || 0.65), n = 36;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const t = (i / (n - 1)) * 2 - 1;
+    let w = 1;
+    if (mode === 'uniform') w = 1;
+    else if (mode === 'pyramid') w = Math.max(0.02, 1 - Math.abs(t));
+    else if (mode === 'ascending') w = (t + 1) / 2 + 0.02;
+    else if (mode === 'descending') w = (1 - t) / 2 + 0.02;
+    else if (mode === 'vegas') w = Math.max(0.02, Math.pow(0.5 * (1 + Math.cos(t * Math.PI)), 1.2));
+    else if (mode === 'gaussian_bound') w = Math.max(0.02, Math.exp(-0.5 * (t / sigma) ** 2) - Math.exp(-0.5 / (sigma ** 2)));
+    else w = Math.exp(-0.5 * (t / sigma) ** 2);
+    pts.push(w);
+  }
+  const maxW = Math.max(...pts, 0.01);
+  const d = pts.map((w, i) => `${i === 0 ? 'M' : 'L'}${(6 + (i / (n - 1)) * 168).toFixed(1)},${(40 - (w / maxW) * 32).toFixed(1)}`).join(' ');
+  path.setAttribute('d', d);
+}
+function updateLabels() {$('compression-hint').textContent=$('compression_mode').value==='aggressive'?'HEVC com compressão forte: prioriza tamanho, com perda visível em detalhes e movimentos. Mantém resolução e FPS.':'HEVC com alta fidelidade: prioriza preservar detalhes com perda visual mínima. Não é sem perdas; o tamanho depende do vídeo.';$('engine-badge').textContent='FLOW / '+$('processing').value.toUpperCase();window.updateSummary?.();$('preview').innerHTML=icon('play')+' Testar '+$('preview_duration').value+' segundos';$('preview-tag').textContent='PRÉVIA · ATÉ '+$('preview_duration').value+' SEGUNDOS'; $('shutter-value').textContent = `${$('shutter').value}°`; $('sharpness-value').textContent = `${$('sharpness').value}%`; updateWeightCurve(); }
 function markStale() { if (lastResult) $('job-detail').textContent = 'Ajustes alterados. Gere uma nova prévia para ver as mudanças.'; }
-['compression_enabled','compression_mode','shutter','samples','sharpness','protection','fps','codec','crf','start','analysis_width','search_radius','weighting','encoder_preset','gamma','gaussian_sigma','brightness','contrast','saturation','preserve_audio','preview_duration','processing','video_encoder','deduplicate','vector_smoothing','dehalo','hud_protect'].forEach(id => $(id).addEventListener('input', () => {updateLabels(); markStale(); if(['shutter','samples','sharpness'].includes(id)) document.querySelectorAll('[data-preset]').forEach(b => b.classList.remove('active')); }));
+['compression_enabled','compression_mode','shutter','samples','sharpness','protection','fps','codec','crf','start','analysis_width','search_radius','weighting','encoder_preset','gamma','gaussian_sigma','brightness','contrast','saturation','preserve_audio','preview_duration','processing','video_encoder','deduplicate','vector_smoothing','dehalo','hud_protect','subframe_blend'].forEach(id => $(id).addEventListener('input', () => {updateLabels(); markStale(); if(['shutter','samples','sharpness'].includes(id)) document.querySelectorAll('[data-preset]').forEach(b => b.classList.remove('active')); }));
 $('codec').onchange = () => {if($('compression_enabled').checked&&$('codec').value==='prores')$('codec').value='h264';$('codec').querySelector('[value="prores"]').disabled=$('compression_enabled').checked;$('video_encoder').querySelector('[value="cpu"]').textContent=$('compression_enabled').checked?'CPU · HEVC':'CPU · H.264'; $('crf').disabled = $('codec').value === 'prores'||$('compression_enabled').checked;$('video_encoder').disabled=$('codec').value==='prores'&&!$('compression_enabled').checked;$('codec').querySelector('[value="h264"]').textContent=$('compression_enabled').checked?'MP4 · HEVC comprimido':'MP4 · H.264';};
 $('compression_enabled').addEventListener('input',()=>{$('codec').onchange(); });
-function settings(preview) {return {compression_enabled:$('compression_enabled').checked,compression_mode:$('compression_mode').value,media_id:media.id,shutter:+$('shutter').value,samples:+$('samples').value,protection:$('protection').checked,sharpness:+$('sharpness').value/100,fps:$('fps').value,codec:$('codec').value,crf:+$('crf').value,analysis_width:+$('analysis_width').value,search_radius:+$('search_radius').value,weighting:$('weighting').value,encoder_preset:$('encoder_preset').value,gamma:+$('gamma').value,gaussian_sigma:+$('gaussian_sigma').value,brightness:+$('brightness').value,contrast:+$('contrast').value,saturation:+$('saturation').value,preserve_audio:$('preserve_audio').checked,preview_duration:+$('preview_duration').value,processing:$('processing').value,video_encoder:$('video_encoder').value,deduplicate:$('deduplicate').checked,vector_smoothing:$('vector_smoothing').checked,dehalo:$('dehalo').checked,hud_protect:$('hud_protect').checked,start:preview ? +$('start').value : 0,preview};}
+function settings(preview) {return {compression_enabled:$('compression_enabled').checked,compression_mode:$('compression_mode').value,media_id:media.id,shutter:+$('shutter').value,samples:+$('samples').value,protection:$('protection').checked,sharpness:+$('sharpness').value/100,fps:$('fps').value,codec:$('codec').value,crf:+$('crf').value,analysis_width:+$('analysis_width').value,search_radius:+$('search_radius').value,weighting:$('weighting').value,encoder_preset:$('encoder_preset').value,gamma:+$('gamma').value,gaussian_sigma:+$('gaussian_sigma').value,brightness:+$('brightness').value,contrast:+$('contrast').value,saturation:+$('saturation').value,preserve_audio:$('preserve_audio').checked,preview_duration:+$('preview_duration').value,processing:$('processing').value,video_encoder:$('video_encoder').value,deduplicate:$('deduplicate').checked,vector_smoothing:$('vector_smoothing').checked,dehalo:$('dehalo').checked,hud_protect:$('hud_protect').checked,subframe_blend:$('subframe_blend').checked,start:preview ? +$('start').value : 0,preview};}
 const queue = [];
 function renderQueue() {
   const panel = $('queue-panel'), list = $('queue-list');

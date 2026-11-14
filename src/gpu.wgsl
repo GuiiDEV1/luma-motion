@@ -244,6 +244,8 @@ fn smooth_vectors(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let bx = i32(i % p.fw);
     let by = i32(i / p.fw);
+    let center_pos = vec2<i32>(min(bx * 8, i32(p.gw) - 1), min(by * 8, i32(p.gh) - 1));
+    let center_l = gray_at(center_pos, 0u);
     let cw = center.z + 0.05;
     var sum_xy = center.xy * cw * 2.0;
     var sum_c = center.z * 2.0;
@@ -254,10 +256,13 @@ fn smooth_vectors(@builtin(global_invocation_id) id: vec3<u32>) {
             if (dx == 0 && dy == 0) {
                 continue;
             }
-            let nx = u32(clamp(bx + dx, 0, i32(p.fw) - 1));
-            let ny = u32(clamp(by + dy, 0, i32(p.fh) - 1));
-            let n = vectors[ny * p.fw + nx];
-            let w = n.z + 0.05;
+            let nx = clamp(bx + dx, 0, i32(p.fw) - 1);
+            let ny = clamp(by + dy, 0, i32(p.fh) - 1);
+            let n = vectors[u32(ny) * p.fw + u32(nx)];
+            let n_pos = vec2<i32>(min(nx * 8, i32(p.gw) - 1), min(ny * 8, i32(p.gh) - 1));
+            let dl = center_l - gray_at(n_pos, 0u);
+            let edge_w = max(exp(-dl * dl / 400.0), 0.08);
+            let w = (n.z + 0.05) * edge_w;
             sum_xy += n.xy * w;
             sum_c += n.z;
             w_total += w;
@@ -363,13 +368,25 @@ fn integrate(@builtin(global_invocation_id) id: vec3<u32>) {
         jitter = (ign(pos) - 0.5) / f32(p.samples);
     }
     let has_next = (p.flags & 8u) != 0u;
+    let subframe_blend = (p.flags & 32u) != 0u;
     var total = vec3<f32>(0.0);
     var w_sum = 0.0;
     for (var i = 0u; i < p.samples; i++) {
         let base_t = f32(i) / f32(p.samples - 1u) - 0.5;
         let t = clamp(base_t + jitter, -0.5, 0.5) * p.shutter / 360.0;
         var c: vec3<f32>;
-        if (t < 0.0) {
+        if (subframe_blend) {
+            let curr_s = sample_frame(pos + delta * t, 0u);
+            if (t < 0.0) {
+                let prev_s = sample_frame(pos + delta * (t + 1.0), 1u);
+                c = mix(curr_s, prev_s, clamp(-t * 2.0, 0.0, 1.0));
+            } else if (has_next) {
+                let next_s = sample_frame(pos - delta * (1.0 - t), 2u);
+                c = mix(curr_s, next_s, clamp(t * 2.0, 0.0, 1.0));
+            } else {
+                c = curr_s;
+            }
+        } else if (t < 0.0) {
             c = sample_frame(pos + delta * (t + 1.0), 1u);
         } else if (has_next) {
             c = sample_frame(pos - delta * (1.0 - t), 2u);

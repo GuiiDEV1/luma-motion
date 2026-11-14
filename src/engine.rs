@@ -19,6 +19,7 @@ pub struct Meta {
     pub duration: f64,
     pub codec: String,
     pub audio: bool,
+    pub hdr: bool,
     pub bytes: u64,
     pub source_bytes: u64,
     pub render_seconds: f64,
@@ -89,9 +90,7 @@ pub fn probe(path: &Path) -> Result<Meta, String> {
     {
         return Err("Use vídeo até 4K, de 1 a 240 fps, com duração válida.".into());
     }
-    if video["color_transfer"] == "smpte2084" || video["color_transfer"] == "arib-std-b67" {
-        return Err("Converta o vídeo HDR para SDR antes de usar esta versão.".into());
-    }
+    let hdr = video["color_transfer"] == "smpte2084" || video["color_transfer"] == "arib-std-b67";
     Ok(Meta {
         width,
         height,
@@ -99,6 +98,7 @@ pub fn probe(path: &Path) -> Result<Meta, String> {
         duration,
         codec: video["codec_name"].as_str().unwrap_or("unknown").into(),
         audio: streams.iter().any(|s| s["codec_type"] == "audio"),
+        hdr,
         bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         source_bytes: 0,
         render_seconds: 0.0,
@@ -140,6 +140,7 @@ pub struct Settings {
     pub vector_smoothing: bool,
     pub dehalo: bool,
     pub hud_protect: bool,
+    pub subframe_blend: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -174,6 +175,7 @@ impl Default for Settings {
             vector_smoothing: true,
             dehalo: true,
             hud_protect: true,
+            subframe_blend: true,
         }
     }
 }
@@ -196,8 +198,16 @@ impl Settings {
             || !(14..=28).contains(&self.crf)
             || ![320, 480, 720].contains(&self.analysis_width)
             || ![8, 16, 24].contains(&self.search_radius)
-            || !["gaussian", "uniform", "pyramid", "ascending", "descending"]
-                .contains(&self.weighting.as_str())
+            || ![
+                "gaussian",
+                "gaussian_bound",
+                "vegas",
+                "uniform",
+                "pyramid",
+                "ascending",
+                "descending",
+            ]
+            .contains(&self.weighting.as_str())
             || !["fast", "medium", "slow"].contains(&self.encoder_preset.as_str())
         {
             return Err("Configuração inválida ou fora dos limites.".into());
@@ -276,7 +286,11 @@ pub fn render(
     }
     let fps = settings.fps.parse::<f64>().unwrap_or(meta.fps);
     let gpu_interp = gpu.is_some() && fps > meta.fps + 0.1;
-    let mut filters = vec![format!("scale={w}:{h}")];
+    let mut filters = Vec::new();
+    if meta.hdr {
+        filters.push("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv".into());
+    }
+    filters.push(format!("scale={w}:{h}"));
     if fps > meta.fps + 0.1 && !gpu_interp {
         filters.insert(0, "tpad=stop_mode=clone:stop_duration=0.1".into());
         filters.push(format!("minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"));
@@ -381,6 +395,7 @@ pub fn render(
         settings.vector_smoothing,
         settings.dehalo,
         settings.hud_protect,
+        settings.subframe_blend,
     );
     let mut previous: Option<Vec<u8>> = None;
     let mut frame = vec![0u8; w * h * stride];
